@@ -1,0 +1,9 @@
+streamlit>=1.40
+chess>=1.10
+board-to-fen>=0.1.1
+tensorflow>=2.16
+opencv-python-headless>=4.9
+pillow>=10.0
+numpy<2.0
+anthropic>=0.40
+requests>=2.31
