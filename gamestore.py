@@ -69,12 +69,32 @@ def _user_dir(user: str) -> str:
     return path
 
 
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^\w-]", "_", name).strip("_") or "game"
+
+
+def path_for(user: str, game_id: str) -> str:
+    return os.path.join(_user_dir(user), f"{_safe_name(game_id)}.pgn")
+
+
 def save_game(user: str, game_id: str, pgn_text: str) -> str:
-    safe = re.sub(r"[^\w-]", "_", game_id)
-    path = os.path.join(_user_dir(user), f"{safe}.pgn")
+    path = path_for(user, game_id)
     with open(path, "w", encoding="utf-8") as f:
         f.write(pgn_text)
     return path
+
+
+def rename_game(user: str, old_game_id: str, new_game_id: str) -> str:
+    """Rename a saved game on disk. Returns the sanitized new game_id."""
+    new_id = _safe_name(new_game_id)
+    old_path = path_for(user, old_game_id)
+    new_path = path_for(user, new_id)
+    if old_path != new_path:
+        if os.path.exists(new_path):
+            raise FileExistsError(f'A saved game called "{new_id}" already exists.')
+        if os.path.exists(old_path):
+            os.replace(old_path, new_path)
+    return new_id
 
 
 def list_saved(user: str) -> list[str]:

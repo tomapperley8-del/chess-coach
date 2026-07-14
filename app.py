@@ -236,6 +236,18 @@ if stage == "upload":
                 st.session_state.stage = "game"
                 st.rerun()
 
+        with st.expander("Rename this saved game"):
+            current_name = os.path.splitext(os.path.basename(choice))[0]
+            new_name = st.text_input("New name", value=current_name, key="rename_saved_input")
+            if st.button("Rename", key="rename_saved_btn"):
+                new_name = new_name.strip()
+                if new_name and new_name != current_name:
+                    try:
+                        gamestore.rename_game(username, current_name, new_name)
+                        st.rerun()
+                    except FileExistsError as exc:
+                        st.error(str(exc))
+
 # ---------------------------------------------------------------------------
 # Stage 2: confirm the detected position
 # ---------------------------------------------------------------------------
@@ -484,6 +496,21 @@ elif stage == "game":
             file_name=f"{st.session_state.game_id}.pgn",
             mime="application/x-chess-pgn", width="stretch",
         )
+
+    with st.expander("Rename this game"):
+        new_id = st.text_input(
+            "Name", value=st.session_state.game_id, key="rename_active_input",
+        )
+        if st.button("Rename", key="rename_active_btn"):
+            new_id = new_id.strip()
+            if new_id and new_id != st.session_state.game_id:
+                try:
+                    st.session_state.game_id = gamestore.rename_game(
+                        username, st.session_state.game_id, new_id,
+                    )
+                    st.rerun()
+                except FileExistsError as exc:
+                    st.error(str(exc))
 
     with st.expander("Game so far (PGN)"):
         st.code(_current_pgn(), language=None)
