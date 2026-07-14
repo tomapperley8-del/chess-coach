@@ -17,6 +17,7 @@ import chess
 import chess.svg
 import streamlit as st
 
+import auth
 import coach
 import engine as engine_mod
 import fetcher
@@ -76,7 +77,8 @@ def _current_board() -> chess.Board:
 
 def _reset():
     for key in list(st.session_state.keys()):
-        del st.session_state[key]
+        if key != "user":
+            del st.session_state[key]
 
 
 def _render_board(board: chess.Board, arrow_san: str | None = None, flipped: bool = False):
@@ -115,7 +117,7 @@ def _current_pgn() -> str:
 
 def _save():
     try:
-        gamestore.save_game(st.session_state.game_id, _current_pgn())
+        gamestore.save_game(st.session_state.user, st.session_state.game_id, _current_pgn())
     except OSError:
         pass  # read-only filesystem is fine; download still works
 
@@ -138,7 +140,14 @@ def _start_game(start_fen, prefix, headers, review):
     _save()
 
 
-st.title("♞ Chess Coach")
+username = auth.require_login()
+
+title_col, logout_col = st.columns([4, 1])
+with title_col:
+    st.title("♞ Chess Coach")
+    st.caption(f"Signed in as **{username}**")
+with logout_col:
+    auth.logout_button()
 
 stage = st.session_state.get("stage", "upload")
 
@@ -193,7 +202,7 @@ if stage == "upload":
         st.session_state.stage = "confirm"
         st.rerun()
 
-    saved = gamestore.list_saved()
+    saved = gamestore.list_saved(username)
     if saved:
         st.divider()
         st.caption("Or pick up where you left off:")

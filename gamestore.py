@@ -62,20 +62,28 @@ def build_pgn(
     return str(game)
 
 
-def save_game(game_id: str, pgn_text: str) -> str:
-    os.makedirs(SAVE_DIR, exist_ok=True)
+def _user_dir(user: str) -> str:
+    safe_user = re.sub(r"[^\w-]", "_", user)
+    path = os.path.join(SAVE_DIR, safe_user)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def save_game(user: str, game_id: str, pgn_text: str) -> str:
     safe = re.sub(r"[^\w-]", "_", game_id)
-    path = os.path.join(SAVE_DIR, f"{safe}.pgn")
+    path = os.path.join(_user_dir(user), f"{safe}.pgn")
     with open(path, "w", encoding="utf-8") as f:
         f.write(pgn_text)
     return path
 
 
-def list_saved() -> list[str]:
-    """Saved game files, newest first."""
-    if not os.path.isdir(SAVE_DIR):
+def list_saved(user: str) -> list[str]:
+    """This user's saved game files, newest first."""
+    safe_user = re.sub(r"[^\w-]", "_", user)
+    user_dir = os.path.join(SAVE_DIR, safe_user)
+    if not os.path.isdir(user_dir):
         return []
-    files = [os.path.join(SAVE_DIR, f) for f in os.listdir(SAVE_DIR) if f.endswith(".pgn")]
+    files = [os.path.join(user_dir, f) for f in os.listdir(user_dir) if f.endswith(".pgn")]
     return sorted(files, key=os.path.getmtime, reverse=True)
 
 
