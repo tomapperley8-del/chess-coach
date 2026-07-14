@@ -377,6 +377,14 @@ elif stage == "game":
     student_white = st.session_state.student_white
     my_turn = board.turn == student_white
     game_over = board.is_game_over()
+    h = st.session_state.headers
+
+    # --- persistent status line, shown above the board at all times ---
+    turn_label = "Your move" if my_turn else "Waiting for your opponent's move"
+    status_line = st.empty()
+    status_line.caption(
+        f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number} · {turn_label}"
+    )
 
     # --- engine analysis for the current position (cached per FEN) ---
     analysis = st.session_state.analyses.get(fen)
@@ -413,19 +421,20 @@ elif stage == "game":
             st.session_state.reviewed.add(ply)
             _save()  # so blunder notes land in the saved PGN
 
+    if game_over:
+        status_line.success(f"Game over: {board.result()}")
+    elif analysis:
+        status_line.caption(
+            f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number} · "
+            f"{turn_label} · Engine eval: {analysis.eval_text()}"
+        )
+
     recommended = None
     if analysis and my_turn and not game_over:
         recommended = analysis.human_move_san or (
             analysis.best.move_san if analysis.best else None
         )
     _render_board(board, arrow_san=recommended, flipped=not student_white)
-
-    h = st.session_state.headers
-    st.caption(f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number}")
-    if game_over:
-        st.success(f"Game over: {board.result()}")
-    elif analysis:
-        st.caption(f"Engine eval: {analysis.eval_text()}")
 
     # --- coaching (needs an Anthropic key; everything else works without) ---
     if not game_over:

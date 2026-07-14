@@ -87,7 +87,7 @@ def _line_from_info(board: chess.Board, info: chess.engine.InfoDict) -> EngineLi
     )
 
 
-def analyse_position(fen: str, elo: int | None = None, depth: int = 16, multipv: int = 3) -> Analysis:
+def analyse_position(fen: str, elo: int | None = None, depth: int = 16, multipv: int = 10) -> Analysis:
     """Full-strength MultiPV analysis plus an ELO-limited 'human' move."""
     path = find_stockfish()
     if path is None:
