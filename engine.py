@@ -122,14 +122,28 @@ def analyse_position(fen: str, elo: int | None = None, depth: int = 16, multipv:
     return result
 
 
-def sweep_game(moves_san: list[str], depth: int = 12, progress=None) -> list[dict]:
+def white_cp(analysis: Analysis) -> int:
+    """The analysis eval converted to white's perspective, in centipawns."""
+    best = analysis.best
+    if best is None:
+        return 0
+    if best.mate_in is not None:
+        stm = 10_000 if best.mate_in > 0 else -10_000
+    else:
+        stm = best.score_cp or 0
+    return stm if analysis.turn == "white" else -stm
+
+
+def sweep_game(
+    moves_san: list[str], depth: int = 12, progress=None, start_fen: str | None = None
+) -> list[dict]:
     """Evaluate every position of a game. Returns one dict per ply with the
     eval (white's perspective, centipawns) before and after the move, and the
     swing. Used for blunder detection in full-game review."""
     path = find_stockfish()
     if path is None:
         raise RuntimeError("Stockfish binary not found.")
-    board = chess.Board()
+    board = chess.Board(start_fen) if start_fen else chess.Board()
     results = []
     with chess.engine.SimpleEngine.popen_uci(path) as engine:
         def white_cp() -> int:

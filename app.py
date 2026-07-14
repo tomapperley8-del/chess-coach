@@ -1,7 +1,12 @@
-"""Chess Coach — upload a screenshot, confirm the position, get ELO-aware coaching.
+"""Chess Coach — upload a screenshot, confirm the position, then track the
+game live: type each move as it's played, get ELO-aware coaching, and export
+the PGN at any time.
 
 Flow: upload -> vision (CNN) + metadata (Claude) -> confirmation screen ->
-optional full-game fetch -> Stockfish -> Claude coaching.
+live game (Stockfish + Claude coaching, PGN saved after every move).
+The online game lookup (chess.com / Lichess) is opt-in; everything else
+works with no external service except the coaching call itself, and even
+without an Anthropic key the engine analysis and PGN export still work.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import streamlit as st
 import coach
 import engine as engine_mod
 import fetcher
+import gamestore
 import vision
 
 st.set_page_config(page_title="Chess Coach", page_icon="♞", layout="centered")
@@ -51,13 +57,20 @@ def _default_castling(board: chess.Board) -> str:
     return rights or "-"
 
 
-def _board_from_state() -> chess.Board:
+def _board_from_confirm() -> chess.Board:
     placement = st.session_state.placement
     turn = "w" if st.session_state.turn_white else "b"
     board = chess.Board.empty()
     board.set_board_fen(placement)
     castling = _default_castling(board)
     board.set_fen(f"{placement} {turn} {castling} - 0 1")
+    return board
+
+
+def _current_board() -> chess.Board:
+    board = gamestore.base_board(st.session_state.start_fen)
+    for san in st.session_state.prefix + st.session_state.appended:
+        board.push_san(san)
     return board
 
 
@@ -74,8 +87,55 @@ def _render_board(board: chess.Board, arrow_san: str | None = None, flipped: boo
             arrows = [chess.svg.Arrow(move.from_square, move.to_square, color="#15781B")]
         except ValueError:
             pass
-    svg = chess.svg.board(board, arrows=arrows, flipped=flipped, size=380)
+    lastmove = board.peek() if board.move_stack else None
+    svg = chess.svg.board(board, arrows=arrows, lastmove=lastmove, flipped=flipped, size=380)
     st.image(svg, width="stretch")
+
+
+def _pgn_notes() -> dict[int, str]:
+    notes = {}
+    for entry in st.session_state.get("review", []):
+        loss = entry["loss"]
+        if loss >= 250:
+            notes[entry["ply"]] = f"Blunder - lost {loss / 100:.1f} pawns."
+        elif loss >= 120:
+            notes[entry["ply"]] = f"Mistake - lost {loss / 100:.1f} pawns."
+    return notes
+
+
+def _current_pgn() -> str:
+    return gamestore.build_pgn(
+        st.session_state.start_fen,
+        st.session_state.prefix,
+        st.session_state.appended,
+        st.session_state.headers,
+        notes=_pgn_notes(),
+    )
+
+
+def _save():
+    try:
+        gamestore.save_game(st.session_state.game_id, _current_pgn())
+    except OSError:
+        pass  # read-only filesystem is fine; download still works
+
+
+def _start_game(start_fen, prefix, headers, review):
+    st.session_state.start_fen = start_fen
+    st.session_state.prefix = prefix
+    st.session_state.appended = []
+    st.session_state.headers = headers
+    st.session_state.review = review
+    st.session_state.evals = (
+        {e["ply"]: e["eval_after"] for e in review} | {0: review[0]["eval_before"]}
+        if review else {}
+    )
+    st.session_state.reviewed = {e["ply"] for e in review}
+    st.session_state.analyses = {}
+    st.session_state.coachings = {}
+    st.session_state.game_id = gamestore.new_game_id(headers.get("white"), headers.get("black"))
+    st.session_state.stage = "game"
+    _save()
 
 
 st.title("♞ Chess Coach")
@@ -92,7 +152,7 @@ if stage == "upload":
 
     if not _api_key():
         st.text_input(
-            "Anthropic API key (no key found in secrets)",
+            "Anthropic API key (optional — needed for coaching text)",
             type="password", key="api_key_input",
         )
 
@@ -120,7 +180,6 @@ if stage == "upload":
                 st.stop()
         st.session_state.placement = placement
         st.session_state.flipped = flipped
-        st.session_state.board_img = board_img
         st.session_state.turn_white = not flipped  # crude default: it's your move
         meta = {}
         key = _api_key()
@@ -134,12 +193,46 @@ if stage == "upload":
         st.session_state.stage = "confirm"
         st.rerun()
 
+    saved = gamestore.list_saved()
+    if saved:
+        st.divider()
+        st.caption("Or pick up where you left off:")
+        choice = st.selectbox(
+            "Saved games", saved,
+            format_func=lambda p: os.path.splitext(os.path.basename(p))[0],
+        )
+        if st.button("Resume this game", width="stretch"):
+            loaded = gamestore.load_game(choice)
+            if loaded is None:
+                st.error("Couldn't read that saved game.")
+            else:
+                st.session_state.start_fen = loaded["start_fen"]
+                st.session_state.prefix = loaded["prefix"]
+                st.session_state.appended = []
+                st.session_state.headers = loaded["headers"]
+                st.session_state.review = []
+                st.session_state.evals = {}
+                st.session_state.reviewed = set()
+                st.session_state.analyses = {}
+                st.session_state.coachings = {}
+                st.session_state.game_id = loaded["game_id"]
+                h = loaded["headers"]
+                student_white = h.get("student_side", "white") == "white"
+                st.session_state.student_white = student_white
+                my = h.get("whiteelo") if student_white else h.get("blackelo")
+                opp = h.get("blackelo") if student_white else h.get("whiteelo")
+                st.session_state.my_elo = int(my) if my and str(my).isdigit() else 800
+                st.session_state.opp_elo = int(opp) if opp and str(opp).isdigit() else 800
+                st.session_state.flipped = not student_white
+                st.session_state.stage = "game"
+                st.rerun()
+
 # ---------------------------------------------------------------------------
 # Stage 2: confirm the detected position
 # ---------------------------------------------------------------------------
 elif stage == "confirm":
     st.subheader("Does this match your screenshot?")
-    board = _board_from_state()
+    board = _board_from_confirm()
     _render_board(board, flipped=st.session_state.flipped)
 
     meta = st.session_state.get("meta", {})
@@ -158,6 +251,15 @@ elif stage == "confirm":
         st.radio("Whose move is it?", ["White", "Black"], horizontal=True,
                  index=0 if st.session_state.turn_white else 1)
         == "White"
+    )
+    student_white = (
+        st.radio("Which side are you?", ["White", "Black"], horizontal=True,
+                 index=1 if st.session_state.flipped else 0)
+        == "White"
+    )
+    lookup = st.checkbox(
+        "Look this game up online (chess.com / Lichess) to review earlier moves",
+        value=False,
     )
 
     with st.expander("Fix a square"):
@@ -188,10 +290,56 @@ elif stage == "confirm":
     if not board.is_valid():
         st.warning("This position isn't legal yet (check kings/pawns). Fix it above.")
     else:
-        if st.button("Looks right — coach me", type="primary", width="stretch"):
+        if st.button("Looks right — start coaching", type="primary", width="stretch"):
             st.session_state.my_elo = my_elo
             st.session_state.opp_elo = opp_elo
-            st.session_state.stage = "analyse"
+            st.session_state.student_white = student_white
+            st.session_state.flipped = not student_white
+
+            headers = {
+                "white": meta.get("bottom_username") if meta.get("bottom_is_white") else meta.get("top_username"),
+                "black": meta.get("top_username") if meta.get("bottom_is_white") else meta.get("bottom_username"),
+                "site": meta.get("site") or "chess-coach app",
+                "student_side": "white" if student_white else "black",
+                "whiteelo": my_elo if student_white else opp_elo,
+                "blackelo": opp_elo if student_white else my_elo,
+            }
+            if not headers["white"] and not headers["black"]:
+                headers["white"] = "Me" if student_white else "Opponent"
+                headers["black"] = "Opponent" if student_white else "Me"
+
+            start_fen, prefix, review = board.fen(), [], []
+            if lookup:
+                usernames = [meta.get("bottom_username"), meta.get("top_username")]
+                game = None
+                if any(usernames):
+                    with st.spinner("Looking for this game online..."):
+                        game = fetcher.find_game(board.board_fen(), usernames, meta.get("site"))
+                if game:
+                    prefix = game["moves_san"][: game["ply_of_screenshot"]]
+                    start_fen = None
+                    headers["white"] = game["white"] or headers["white"]
+                    headers["black"] = game["black"] or headers["black"]
+                    st.toast(f"Found it: {game['white']} vs {game['black']}")
+                    if prefix:
+                        bar = st.progress(0.0, "Reviewing the earlier moves with Stockfish...")
+                        try:
+                            review = engine_mod.sweep_game(
+                                prefix,
+                                depth=12 if len(prefix) <= 60 else 8,
+                                progress=lambda f: bar.progress(f),
+                            )
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                            st.stop()
+                        bar.empty()
+                else:
+                    st.warning(
+                        "Couldn't find the game online — carrying on from the "
+                        "screenshot position only."
+                    )
+
+            _start_game(start_fen, prefix, headers, review)
             st.rerun()
 
     if st.button("Start over"):
@@ -199,84 +347,147 @@ elif stage == "confirm":
         st.rerun()
 
 # ---------------------------------------------------------------------------
-# Stage 3: engine + coaching
+# Stage 3: live game — engine, coaching, move entry, PGN export
 # ---------------------------------------------------------------------------
-elif stage == "analyse":
-    board = _board_from_state()
+elif stage == "game":
+    board = _current_board()
     fen = board.fen()
-    meta = st.session_state.get("meta", {})
-    my_elo = st.session_state.my_elo
+    ply = len(st.session_state.prefix) + len(st.session_state.appended)
+    student_white = st.session_state.student_white
+    my_turn = board.turn == student_white
+    game_over = board.is_game_over()
 
-    # Try to fetch the full game so we can review it, not just the snapshot.
-    game = st.session_state.get("game")
-    if game is None and "game_lookup_done" not in st.session_state:
-        usernames = [meta.get("bottom_username"), meta.get("top_username")]
-        if any(usernames):
-            with st.spinner("Looking for this game online..."):
-                game = fetcher.find_game(
-                    board.board_fen(), usernames, meta.get("site"),
-                )
-        st.session_state.game = game
-        st.session_state.game_lookup_done = True
-
-    review = st.session_state.get("review")
-    if game and review is None:
-        bar = st.progress(0.0, "Reviewing the whole game with Stockfish...")
-        try:
-            review = engine_mod.sweep_game(
-                game["moves_san"][: game["ply_of_screenshot"]],
-                progress=lambda f: bar.progress(f),
-            )
-        except RuntimeError as exc:
-            st.error(str(exc))
-            st.stop()
-        bar.empty()
-        st.session_state.review = review
-
-    if "analysis" not in st.session_state:
-        with st.spinner("Analysing the position with Stockfish..."):
+    # --- engine analysis for the current position (cached per FEN) ---
+    analysis = st.session_state.analyses.get(fen)
+    if analysis is None and not game_over:
+        with st.spinner("Analysing with Stockfish..."):
             try:
-                st.session_state.analysis = engine_mod.analyse_position(fen, elo=my_elo)
+                analysis = engine_mod.analyse_position(fen, elo=st.session_state.my_elo)
             except RuntimeError as exc:
                 st.error(str(exc))
                 st.stop()
-    analysis = st.session_state.analysis
+        st.session_state.analyses[fen] = analysis
+        st.session_state.evals[ply] = engine_mod.white_cp(analysis)
+        # If this position follows a live-entered move, log it for the review.
+        if (
+            st.session_state.appended
+            and ply not in st.session_state.reviewed
+            and (ply - 1) in st.session_state.evals
+        ):
+            before = st.session_state.evals[ply - 1]
+            after = st.session_state.evals[ply]
+            b_prev = board.copy()
+            move = b_prev.pop()
+            mover = "white" if b_prev.turn else "black"
+            st.session_state.review.append({
+                "ply": ply,
+                "move_number": b_prev.fullmove_number,
+                "mover": mover,
+                "san": st.session_state.appended[-1],
+                "eval_before": before,
+                "eval_after": after,
+                "loss": -(after - before) if mover == "white" else (after - before),
+                "fen_after": fen,
+            })
+            st.session_state.reviewed.add(ply)
+            _save()  # so blunder notes land in the saved PGN
 
-    recommended = analysis.human_move_san or (analysis.best.move_san if analysis.best else None)
-    _render_board(board, arrow_san=recommended, flipped=st.session_state.flipped)
-    st.caption(f"Engine eval: {analysis.eval_text()}")
-    if game:
-        st.caption(f"Found the game: {game['white']} vs {game['black']} ({game['site']})")
+    recommended = None
+    if analysis and my_turn and not game_over:
+        recommended = analysis.human_move_san or (
+            analysis.best.move_san if analysis.best else None
+        )
+    _render_board(board, arrow_san=recommended, flipped=not student_white)
 
-    if "coaching" not in st.session_state:
+    h = st.session_state.headers
+    st.caption(f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number}")
+    if game_over:
+        st.success(f"Game over: {board.result()}")
+    elif analysis:
+        st.caption(f"Engine eval: {analysis.eval_text()}")
+
+    # --- coaching (needs an Anthropic key; everything else works without) ---
+    if not game_over:
+        auto_coach = st.checkbox("Coach me automatically on my move", value=True)
         key = _api_key()
-        if not key:
-            st.error("No Anthropic API key.")
+        if my_turn and key and (auto_coach or st.button("Coach this position")):
+            coaching = st.session_state.coachings.get(fen)
+            if coaching is None:
+                with st.spinner("Your coach is thinking..."):
+                    try:
+                        coaching = coach.get_coaching(
+                            key, analysis, st.session_state.my_elo,
+                            opponent_elo=st.session_state.opp_elo,
+                            game_review=st.session_state.review or None,
+                        )
+                        st.session_state.coachings[fen] = coaching
+                    except Exception as exc:
+                        st.error(f"Coaching call failed: {exc}")
+            if coaching:
+                st.markdown(coaching)
+        elif my_turn and not key:
+            st.info("No Anthropic key — engine analysis and PGN export still work.")
             st.text_input("Anthropic API key", type="password", key="api_key_input")
-            if st.button("Use this key", type="primary"):
-                st.rerun()
-            st.stop()
-        with st.spinner("Your coach is thinking..."):
-            try:
-                st.session_state.coaching = coach.get_coaching(
-                    key, analysis, my_elo,
-                    opponent_elo=st.session_state.opp_elo,
-                    game_review=review,
-                )
-            except Exception as exc:
-                st.error(f"Coaching call failed: {exc}")
-                st.stop()
+        elif not my_turn:
+            st.caption("Waiting for your opponent's move — enter it below.")
 
-    st.markdown(st.session_state.coaching)
-
-    with st.expander("Raw engine lines"):
-        for i, line in enumerate(analysis.lines):
-            score = (
-                f"mate in {line.mate_in}" if line.mate_in is not None
-                else f"{(line.score_cp or 0) / 100:+.2f}"
+    # --- move entry ---
+    if not game_over:
+        with st.form("move_form", clear_on_submit=True):
+            move_text = st.text_input(
+                "Next move(s)",
+                placeholder="e.g. Nf3 — or several at once: Nf3 d5 e4",
             )
-            st.text(f"{i + 1}. {line.move_san} ({score})  {' '.join(line.pv_san)}")
+            submitted = st.form_submit_button("Play move(s)", type="primary", width="stretch")
+        if submitted and move_text.strip():
+            tokens = move_text.replace(",", " ").split()
+            b2 = board.copy()
+            new_sans = []
+            error = None
+            for token in tokens:
+                try:
+                    move = b2.parse_san(token)
+                except ValueError:
+                    try:
+                        move = b2.parse_uci(token.lower())
+                    except ValueError:
+                        error = f"'{token}' isn't a legal move here."
+                        break
+                new_sans.append(b2.san(move))
+                b2.push(move)
+            if error:
+                st.error(error)
+            else:
+                st.session_state.appended.extend(new_sans)
+                _save()
+                st.rerun()
 
-    if st.button("Analyse another position", type="primary", width="stretch"):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Undo last move", width="stretch",
+                     disabled=not st.session_state.appended):
+            st.session_state.appended.pop()
+            _save()
+            st.rerun()
+    with col_b:
+        st.download_button(
+            "Download PGN", _current_pgn(),
+            file_name=f"{st.session_state.game_id}.pgn",
+            mime="application/x-chess-pgn", width="stretch",
+        )
+
+    with st.expander("Game so far (PGN)"):
+        st.code(_current_pgn(), language=None)
+
+    if analysis:
+        with st.expander("Raw engine lines"):
+            for i, line in enumerate(analysis.lines):
+                score = (
+                    f"mate in {line.mate_in}" if line.mate_in is not None
+                    else f"{(line.score_cp or 0) / 100:+.2f}"
+                )
+                st.text(f"{i + 1}. {line.move_san} ({score})  {' '.join(line.pv_san)}")
+
+    if st.button("New game"):
         _reset()
         st.rerun()
