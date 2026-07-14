@@ -122,6 +122,76 @@ def analyse_position(fen: str, elo: int | None = None, depth: int = 16, multipv:
     return result
 
 
+def _line_cp(line: EngineLine) -> int:
+    """A single comparable centipawn value (mate mapped to a large number)."""
+    if line.mate_in is not None:
+        return 10_000 if line.mate_in > 0 else -10_000
+    return line.score_cp or 0
+
+
+def assess_complexity(analysis: Analysis) -> tuple[str, str]:
+    """Judge, from the multipv spread, how easy this position is to get wrong.
+
+    Returns (level, message) where level is 'calm', 'sharp' or 'critical'.
+    The idea: if only one move holds the evaluation and everything else drops
+    off, a human is very likely to blunder - flag it. Uses only the lines we
+    already computed, so it costs nothing extra."""
+    lines = analysis.lines
+    if len(lines) < 2:
+        return ("calm", "")
+    cps = [_line_cp(ln) for ln in lines]
+    best = cps[0]
+    gap_second = best - cps[1]
+    idx = min(3, len(cps) - 1)
+    gap_topfew = best - cps[idx]
+    if gap_second >= 120:
+        return (
+            "critical",
+            "Tricky position — there's essentially one good move here, so it's "
+            "easy to go wrong. Take your time.",
+        )
+    if gap_topfew >= 150:
+        return (
+            "sharp",
+            "Sharp position — only a couple of moves keep your advantage. "
+            "Calculate carefully before committing.",
+        )
+    return ("calm", "")
+
+
+@dataclass
+class RankedMove:
+    san: str
+    score_cp: int | None  # from the side-to-move's perspective
+    mate_in: int | None
+
+
+def rank_all_moves(fen: str, depth: int = 12) -> list[RankedMove]:
+    """Score every legal move, best to worst. Used for the on-demand
+    'top 20 / worst 10' view - deliberately not run on every move, since a
+    full-width multipv search is heavier than the lean live analysis."""
+    path = find_stockfish()
+    if path is None:
+        raise RuntimeError("Stockfish binary not found.")
+    board = chess.Board(fen)
+    n = board.legal_moves.count()
+    if n == 0:
+        return []
+    ranked = []
+    with chess.engine.SimpleEngine.popen_uci(path) as engine:
+        infos = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=n)
+        if isinstance(infos, dict):
+            infos = [infos]
+        for info in infos:
+            pv = info.get("pv")
+            score = info.get("score")
+            if not pv or score is None:
+                continue
+            pov = score.pov(board.turn)
+            ranked.append(RankedMove(board.san(pv[0]), pov.score(), pov.mate()))
+    return ranked
+
+
 def white_cp(analysis: Analysis) -> int:
     """The analysis eval converted to white's perspective, in centipawns."""
     best = analysis.best

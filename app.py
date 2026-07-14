@@ -140,6 +140,34 @@ def _start_game(start_fen, prefix, headers, review):
     _save()
 
 
+def _resume_saved(path: str) -> bool:
+    """Load a saved PGN into a fresh live-game session. Returns False if the
+    file couldn't be read."""
+    loaded = gamestore.load_game(path)
+    if loaded is None:
+        return False
+    st.session_state.start_fen = loaded["start_fen"]
+    st.session_state.prefix = loaded["prefix"]
+    st.session_state.appended = []
+    st.session_state.headers = loaded["headers"]
+    st.session_state.review = []
+    st.session_state.evals = {}
+    st.session_state.reviewed = set()
+    st.session_state.analyses = {}
+    st.session_state.coachings = {}
+    st.session_state.game_id = loaded["game_id"]
+    h = loaded["headers"]
+    student_white = h.get("student_side", "white") == "white"
+    st.session_state.student_white = student_white
+    my = h.get("whiteelo") if student_white else h.get("blackelo")
+    opp = h.get("blackelo") if student_white else h.get("whiteelo")
+    st.session_state.my_elo = int(my) if my and str(my).isdigit() else 800
+    st.session_state.opp_elo = int(opp) if opp and str(opp).isdigit() else 800
+    st.session_state.flipped = not student_white
+    st.session_state.stage = "game"
+    return True
+
+
 username = auth.require_login()
 
 title_col, logout_col = st.columns([4, 1])
@@ -205,40 +233,28 @@ if stage == "upload":
     saved = gamestore.list_saved(username)
     if saved:
         st.divider()
-        st.caption("Or pick up where you left off:")
-        choice = st.selectbox(
-            "Saved games", saved,
-            format_func=lambda p: os.path.splitext(os.path.basename(p))[0],
-        )
-        if st.button("Resume this game", width="stretch"):
-            loaded = gamestore.load_game(choice)
-            if loaded is None:
-                st.error("Couldn't read that saved game.")
-            else:
-                st.session_state.start_fen = loaded["start_fen"]
-                st.session_state.prefix = loaded["prefix"]
-                st.session_state.appended = []
-                st.session_state.headers = loaded["headers"]
-                st.session_state.review = []
-                st.session_state.evals = {}
-                st.session_state.reviewed = set()
-                st.session_state.analyses = {}
-                st.session_state.coachings = {}
-                st.session_state.game_id = loaded["game_id"]
-                h = loaded["headers"]
-                student_white = h.get("student_side", "white") == "white"
-                st.session_state.student_white = student_white
-                my = h.get("whiteelo") if student_white else h.get("blackelo")
-                opp = h.get("blackelo") if student_white else h.get("whiteelo")
-                st.session_state.my_elo = int(my) if my and str(my).isdigit() else 800
-                st.session_state.opp_elo = int(opp) if opp and str(opp).isdigit() else 800
-                st.session_state.flipped = not student_white
-                st.session_state.stage = "game"
-                st.rerun()
+        st.caption("Jump straight back into a game:")
+        # Quick-select: one tap resumes the most recent games.
+        for path in saved[:6]:
+            name = os.path.splitext(os.path.basename(path))[0]
+            if st.button(f"▶  {name}", key=f"quick_{path}", width="stretch"):
+                if _resume_saved(path):
+                    st.rerun()
+                else:
+                    st.error("Couldn't read that saved game.")
 
-        with st.expander("Rename this saved game"):
+        with st.expander("All saved games / rename"):
+            choice = st.selectbox(
+                "Saved games", saved,
+                format_func=lambda p: os.path.splitext(os.path.basename(p))[0],
+            )
+            if st.button("Resume this game", key="resume_full", width="stretch"):
+                if _resume_saved(choice):
+                    st.rerun()
+                else:
+                    st.error("Couldn't read that saved game.")
             current_name = os.path.splitext(os.path.basename(choice))[0]
-            new_name = st.text_input("New name", value=current_name, key="rename_saved_input")
+            new_name = st.text_input("Rename to", value=current_name, key="rename_saved_input")
             if st.button("Rename", key="rename_saved_btn"):
                 new_name = new_name.strip()
                 if new_name and new_name != current_name:
@@ -379,24 +395,20 @@ elif stage == "game":
     game_over = board.is_game_over()
     h = st.session_state.headers
 
-    # --- persistent status line, shown above the board at all times ---
-    turn_label = "Your move" if my_turn else "Waiting for your opponent's move"
-    status_line = st.empty()
-    status_line.caption(
-        f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number} · {turn_label}"
-    )
+    fast_mode = st.session_state.get("fast_mode", False)
 
-    # --- engine analysis for the current position (cached per FEN) ---
-    analysis = st.session_state.analyses.get(fen)
-    if analysis is None and not game_over:
+    # --- persistent status line, shown above the board at all times ---
+    status_line = st.empty()
+
+    def _run_analysis():
         with st.spinner("Analysing with Stockfish..."):
             try:
-                analysis = engine_mod.analyse_position(fen, elo=st.session_state.my_elo)
+                a = engine_mod.analyse_position(fen, elo=st.session_state.my_elo)
             except RuntimeError as exc:
                 st.error(str(exc))
                 st.stop()
-        st.session_state.analyses[fen] = analysis
-        st.session_state.evals[ply] = engine_mod.white_cp(analysis)
+        st.session_state.analyses[fen] = a
+        st.session_state.evals[ply] = engine_mod.white_cp(a)
         # If this position follows a live-entered move, log it for the review.
         if (
             st.session_state.appended
@@ -406,7 +418,7 @@ elif stage == "game":
             before = st.session_state.evals[ply - 1]
             after = st.session_state.evals[ply]
             b_prev = board.copy()
-            move = b_prev.pop()
+            b_prev.pop()
             mover = "white" if b_prev.turn else "black"
             st.session_state.review.append({
                 "ply": ply,
@@ -420,14 +432,30 @@ elif stage == "game":
             })
             st.session_state.reviewed.add(ply)
             _save()  # so blunder notes land in the saved PGN
+        return a
 
+    # In fast-entry mode the engine call is skipped so moves can be punched in
+    # quickly; analysis (and coaching) then run only when explicitly asked.
+    analysis = st.session_state.analyses.get(fen)
+    if analysis is None and not game_over and not fast_mode:
+        analysis = _run_analysis()
+
+    turn_label = "Your move" if my_turn else "Waiting for opponent's move"
     if game_over:
         status_line.success(f"Game over: {board.result()}")
-    elif analysis:
+    else:
+        base = f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number} · {turn_label}"
         status_line.caption(
-            f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number} · "
-            f"{turn_label} · Engine eval: {analysis.eval_text()}"
+            base + (f" · Engine eval: {analysis.eval_text()}" if analysis else "")
         )
+
+    # --- automatic complexity flag: warn when a human is likely to go wrong ---
+    if analysis and not game_over:
+        level, message = engine_mod.assess_complexity(analysis)
+        if level == "critical":
+            st.warning("⚠️ " + message)
+        elif level == "sharp":
+            st.info("♟ " + message)
 
     recommended = None
     if analysis and my_turn and not game_over:
@@ -436,8 +464,13 @@ elif stage == "game":
         )
     _render_board(board, arrow_san=recommended, flipped=not student_white)
 
+    if analysis is None and not game_over and fast_mode:
+        if st.button("Analyse this position", width="stretch"):
+            _run_analysis()
+            st.rerun()
+
     # --- coaching (needs an Anthropic key; everything else works without) ---
-    if not game_over:
+    if not game_over and analysis:
         auto_coach = st.checkbox("Coach me automatically on my move", value=True)
         key = _api_key()
         if my_turn and key and (auto_coach or st.button("Coach this position")):
@@ -458,15 +491,17 @@ elif stage == "game":
         elif my_turn and not key:
             st.info("No Anthropic key — engine analysis and PGN export still work.")
             st.text_input("Anthropic API key", type="password", key="api_key_input")
-        elif not my_turn:
-            st.caption("Waiting for your opponent's move — enter it below.")
 
     # --- move entry ---
     if not game_over:
+        st.checkbox(
+            "⚡ Fast entry — skip auto-analysis (tap Analyse when you want it)",
+            key="fast_mode",
+        )
         with st.form("move_form", clear_on_submit=True):
             move_text = st.text_input(
                 "Next move(s)",
-                placeholder="e.g. Nf3 — or several at once: Nf3 d5 e4",
+                placeholder="Type moves and press Enter — one or many: Nf3 d5 e4",
             )
             submitted = st.form_submit_button("Play move(s)", type="primary", width="stretch")
         if submitted and move_text.strip():
@@ -532,6 +567,30 @@ elif stage == "game":
                     else f"{(line.score_cp or 0) / 100:+.2f}"
                 )
                 st.text(f"{i + 1}. {line.move_san} ({score})  {' '.join(line.pv_san)}")
+
+    if not game_over:
+        with st.expander("All move rankings — top 20 & worst 10"):
+            if st.button("Compute full rankings", key="rank_btn"):
+                with st.spinner("Scoring every legal move..."):
+                    try:
+                        st.session_state[f"ranks::{fen}"] = engine_mod.rank_all_moves(fen)
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+            ranks = st.session_state.get(f"ranks::{fen}")
+            if ranks:
+                def _fmt_rank(rm):
+                    if rm.mate_in is not None:
+                        return f"mate in {rm.mate_in}"
+                    return f"{(rm.score_cp or 0) / 100:+.2f}"
+                st.caption(f"Top {min(20, len(ranks))} moves")
+                for i, rm in enumerate(ranks[:20], 1):
+                    st.text(f"{i:>2}. {rm.san:<7} {_fmt_rank(rm)}")
+                if len(ranks) > 20:
+                    st.caption("Worst 10 moves")
+                    worst = ranks[-10:]
+                    start = len(ranks) - len(worst) + 1
+                    for j, rm in enumerate(worst, start):
+                        st.text(f"{j:>2}. {rm.san:<7} {_fmt_rank(rm)}")
 
     if st.button("New game"):
         _reset()
