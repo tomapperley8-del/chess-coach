@@ -15,7 +15,11 @@ import json
 from engine import Analysis
 
 ANTHROPIC_MODEL = "claude-sonnet-5"
-GEMINI_MODEL = "gemini-2.0-flash"
+# gemini-flash-latest tracks the current free-tier Flash model (2.0-flash's
+# free quota is often zero on a fresh project). It's a 2.5-class model with
+# "thinking" on by default, which would eat the whole output-token budget and
+# return empty text — we disable it in _gemini_generate.
+GEMINI_MODEL = "gemini-flash-latest"
 
 _METADATA_PROMPT = (
     "This is a screenshot of a chess app. Extract ONLY text you can actually "
@@ -155,7 +159,10 @@ def _gemini_generate(key: str, parts: list[dict], system: str | None, max_tokens
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     body: dict = {
         "contents": [{"parts": parts}],
-        "generationConfig": {"maxOutputTokens": max_tokens},
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "thinkingConfig": {"thinkingBudget": 0},  # else thinking eats the budget
+        },
     }
     if system:
         body["system_instruction"] = {"parts": [{"text": system}]}
