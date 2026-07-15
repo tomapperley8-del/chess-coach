@@ -18,12 +18,20 @@ import chess.svg
 import streamlit as st
 
 import auth
-import board_ui
+import chessboard
 import coach
 import engine as engine_mod
 import fetcher
 import gamestore
 import vision
+
+PROMO_MAP = {"q": chess.QUEEN, "r": chess.ROOK, "b": chess.BISHOP, "n": chess.KNIGHT}
+ADD_PIECES = {
+    "♙ White pawn": "P", "♘ White knight": "N", "♗ White bishop": "B",
+    "♖ White rook": "R", "♕ White queen": "Q", "♔ White king": "K",
+    "♟ Black pawn": "p", "♞ Black knight": "n", "♝ Black bishop": "b",
+    "♜ Black rook": "r", "♛ Black queen": "q", "♚ Black king": "k",
+}
 
 st.set_page_config(page_title="Chess Coach", page_icon="♞", layout="centered")
 
@@ -275,10 +283,46 @@ if stage == "upload":
 # ---------------------------------------------------------------------------
 elif stage == "confirm":
     st.subheader("Does this match your screenshot?")
-    st.caption("Tap the board to fix any wrong squares before analysing.")
-    board_ui.edit_board("placement", st.session_state.flipped, key="confirm_edit")
-    board = _board_from_confirm()
+    st.caption("Drag pieces to fix the board. To change or remove a piece, pick a "
+               "tool below then tap a square.")
 
+    tool = st.radio("Edit tool", ["Move", "Add piece", "Erase"],
+                    horizontal=True, key="edit_tool")
+    if tool == "Erase":
+        brush = "erase"
+    elif tool == "Add piece":
+        add_label = st.selectbox("Piece to place", list(ADD_PIECES), key="add_piece")
+        brush = ADD_PIECES[add_label]
+    else:
+        brush = "move"
+
+    orient = "black" if st.session_state.flipped else "white"
+    fen_str = f"{st.session_state.placement} w - - 0 1"
+    res = chessboard.show_board(
+        fen_str, free=True, orientation=orient, brush=brush, key="confirm_board",
+    )
+    if res and res.get("id") != st.session_state.get("_edit_id"):
+        st.session_state["_edit_id"] = res["id"]
+        b = chess.Board.empty()
+        b.set_board_fen(st.session_state.placement)
+        if res.get("tap"):
+            sq = chess.parse_square(res["tap"])
+            if brush == "erase":
+                b.remove_piece_at(sq)
+            elif brush not in ("move", "erase"):
+                b.set_piece_at(sq, chess.Piece.from_symbol(brush))
+            st.session_state.placement = b.board_fen()
+            st.rerun()
+        elif res.get("from") and res.get("to"):
+            frm, to = chess.parse_square(res["from"]), chess.parse_square(res["to"])
+            pc = b.piece_at(frm)
+            b.remove_piece_at(frm)
+            if pc:
+                b.set_piece_at(to, pc)
+            st.session_state.placement = b.board_fen()
+            st.rerun()
+
+    board = _board_from_confirm()
     meta = st.session_state.get("meta", {})
     col1, col2 = st.columns(2)
     with col1:
@@ -456,17 +500,30 @@ elif stage == "game":
             analysis.best.move_san if analysis.best else None
         )
 
-    st.session_state.setdefault("tap_moves", True)
-    if not game_over and st.session_state["tap_moves"]:
-        tapped = board_ui.move_board(
-            board, flipped=not student_white, key="game_board", arrow_san=recommended,
+    if not game_over:
+        res = chessboard.show_board(
+            fen,
+            dests=chessboard.legal_dests(board),
+            orientation="white" if student_white else "black",
+            last_move=chessboard.last_move_squares(board),
+            key="game_board",
         )
-        if tapped is not None:
-            st.session_state.appended.append(board.san(tapped))
-            _save()
-            st.rerun()
+        if recommended:
+            st.caption(f"💡 Suggested move: **{recommended}**")
+        if res and res.get("id") != st.session_state.get("_game_move_id"):
+            st.session_state["_game_move_id"] = res["id"]
+            frm, to = res.get("from"), res.get("to")
+            if frm and to:
+                mv = chess.Move(
+                    chess.parse_square(frm), chess.parse_square(to),
+                    promotion=PROMO_MAP.get(res.get("promotion")),
+                )
+                if mv in board.legal_moves:
+                    st.session_state.appended.append(board.san(mv))
+                    _save()
+                    st.rerun()
     else:
-        _render_board(board, arrow_san=recommended, flipped=not student_white)
+        _render_board(board, flipped=not student_white)
 
     if analysis is None and not game_over and fast_mode:
         if st.button("Analyse this position", width="stretch"):
@@ -496,11 +553,9 @@ elif stage == "game":
             st.info("No AI key set — engine analysis and PGN export still work.")
             st.text_input("Anthropic API key", type="password", key="api_key_input")
 
-    # --- move entry ---
+    # --- move entry: drag/tap on the board above, or type here ---
     if not game_over:
-        opt1, opt2 = st.columns(2)
-        opt1.checkbox("Tap board to move", key="tap_moves")
-        opt2.checkbox(
+        st.checkbox(
             "⚡ Fast entry", key="fast_mode",
             help="Skip auto-analysis so you can enter moves quickly; tap "
                  "Analyse when you want the engine.",

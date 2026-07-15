@@ -1,0 +1,320 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<style>
+  :root {
+    --light: #EBECD0;
+    --dark: #739552;
+    --sel: #f7ec74;
+    --last: rgba(247, 236, 116, 0.55);
+    --dot: rgba(20, 20, 20, 0.16);
+  }
+  * { box-sizing: border-box; -webkit-user-select: none; user-select: none;
+      -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif;
+               background: transparent; overflow: hidden; }
+  #wrap { width: 100%; max-width: 480px; margin: 0 auto; }
+  #board { position: relative; width: 100%; aspect-ratio: 1 / 1; touch-action: none;
+           border-radius: 4px; overflow: hidden; }
+  .sq { position: absolute; width: 12.5%; height: 12.5%; }
+  .sq.l { background: var(--light); }
+  .sq.d { background: var(--dark); }
+  .coord { position: absolute; font-size: 9px; font-weight: 700; opacity: 0.65; padding: 1px 2px; }
+  .cf { bottom: 0; right: 2px; } .cr { top: 0; left: 2px; }
+  .layer { position: absolute; inset: 0; z-index: 3; }
+  .hl { position: absolute; width: 12.5%; height: 12.5%; z-index: 1; }
+  .hl.last { background: var(--last); }
+  .hl.sel  { box-shadow: inset 0 0 0 4px var(--sel); }
+  .dot { position: absolute; width: 12.5%; height: 12.5%; z-index: 2;
+         display: flex; align-items: center; justify-content: center; pointer-events: none; }
+  .dot::after { content: ""; width: 30%; height: 30%; border-radius: 50%; background: var(--dot); }
+  .dot.cap::after { width: 92%; height: 92%; border-radius: 50%; background: transparent;
+                    box-shadow: inset 0 0 0 5px var(--dot); }
+  .pc { position: absolute; width: 12.5%; height: 12.5%; z-index: 4; cursor: grab;
+        touch-action: none; transition: transform 0.08s ease; will-change: transform; }
+  .pc.drag { z-index: 20; transition: none; cursor: grabbing; }
+  .pc img { width: 100%; height: 100%; pointer-events: none; display: block; }
+  .pc .g { display: none; width: 100%; height: 100%; text-align: center;
+           line-height: 1; font-size: 42px; }
+  .pc.fallback img { display: none; }
+  .pc.fallback .g { display: block; }
+  .pc .g.w { color: #fff; text-shadow: 0 0 1px #000, 0 1px 2px rgba(0,0,0,.5); }
+  .pc .g.b { color: #111; text-shadow: 0 0 1px #000; }
+  #promo { position: absolute; z-index: 40; background: #fff; border-radius: 6px;
+           box-shadow: 0 4px 16px rgba(0,0,0,.4); display: none; }
+  #promo button { display: block; width: 56px; height: 56px; border: none; background: #fff;
+                  font-size: 40px; cursor: pointer; line-height: 1; }
+  #promo button:hover { background: #dbeafe; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="board">
+    <div id="squares"></div>
+    <div id="hls" class="layer" style="z-index:1"></div>
+    <div id="dots" class="layer" style="z-index:2"></div>
+    <div id="pieces" class="layer" style="z-index:4"></div>
+    <div id="promo"></div>
+  </div>
+</div>
+<script>
+(function () {
+  const GLYPH = { P:"♙", N:"♘", B:"♗", R:"♖", Q:"♕", K:"♔",
+                  p:"♟", n:"♞", b:"♝", r:"♜", q:"♛", k:"♚" };
+  const PIECE_URL = (c) => {
+    const color = c === c.toUpperCase() ? "w" : "b";
+    return "https://cdn.jsdelivr.net/gh/lichess-org/lila@master/public/piece/cburnett/"
+           + color + c.toUpperCase() + ".svg";
+  };
+
+  const boardEl  = document.getElementById("board");
+  const sqEl     = document.getElementById("squares");
+  const hlEl     = document.getElementById("hls");
+  const dotEl    = document.getElementById("dots");
+  const pcEl     = document.getElementById("pieces");
+  const promoEl  = document.getElementById("promo");
+
+  let state = { fen: null, dests: {}, orientation: "white", lastMove: null,
+                free: false, brush: "move" };
+  let placement = [];        // 64 entries, piece char or null, index = file + rank*8
+  let selected = null;       // square index or null
+  let moveId = 0;
+  let squaresBuilt = false;
+
+  // ---- Streamlit protocol ----
+  function send(value) {
+    window.parent.postMessage(
+      { isStreamlitMessage: true, type: "streamlit:setComponentValue", value: value, dataType: "json" },
+      "*");
+  }
+  function setHeight() {
+    const h = document.getElementById("wrap").offsetHeight;
+    window.parent.postMessage(
+      { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*");
+  }
+  window.addEventListener("message", (e) => {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    const a = e.data.args || {};
+    state.fen = a.fen; state.dests = a.dests || {}; state.orientation = a.orientation || "white";
+    state.lastMove = a.last_move || null; state.free = !!a.free; state.brush = a.brush || "move";
+    selected = null;
+    parseFen(state.fen);
+    render();
+    setHeight();
+  });
+
+  // ---- helpers ----
+  function parseFen(fen) {
+    placement = new Array(64).fill(null);
+    const rows = fen.split(" ")[0].split("/");   // rank 8 first
+    for (let r = 0; r < 8; r++) {
+      const rank = 7 - r;
+      let file = 0;
+      for (const ch of rows[r]) {
+        if (/\d/.test(ch)) { file += parseInt(ch, 10); }
+        else { placement[file + rank * 8] = ch; file++; }
+      }
+    }
+  }
+  const fileOf = (sq) => sq % 8;
+  const rankOf = (sq) => Math.floor(sq / 8);
+  const sqName = (sq) => "abcdefgh"[fileOf(sq)] + (rankOf(sq) + 1);
+  function colRow(sq) {
+    const f = fileOf(sq), r = rankOf(sq);
+    return state.orientation === "white" ? [f, 7 - r] : [7 - f, r];
+  }
+  function pctPos(sq) { const [c, rw] = colRow(sq); return [c * 12.5, rw * 12.5]; }
+  function sqFromXY(clientX, clientY) {
+    const rect = boardEl.getBoundingClientRect();
+    let x = (clientX - rect.left) / rect.width, y = (clientY - rect.top) / rect.height;
+    x = Math.min(0.999, Math.max(0, x)); y = Math.min(0.999, Math.max(0, y));
+    const col = Math.floor(x * 8), row = Math.floor(y * 8);
+    const f = state.orientation === "white" ? col : 7 - col;
+    const r = state.orientation === "white" ? 7 - row : row;
+    return f + r * 8;
+  }
+
+  function buildSquares() {
+    sqEl.innerHTML = "";
+    for (let sq = 0; sq < 64; sq++) {
+      const [left, top] = pctPos(sq);
+      const d = document.createElement("div");
+      const dark = (fileOf(sq) + rankOf(sq)) % 2 === 0;   // a1 dark
+      d.className = "sq " + (dark ? "d" : "l");
+      d.style.left = left + "%"; d.style.top = top + "%";
+      const [c, rw] = colRow(sq);
+      if (rw === 7) { const cf = document.createElement("span"); cf.className = "coord cf";
+        cf.textContent = "abcdefgh"[fileOf(sq)]; cf.style.color = dark ? "#EBECD0" : "#739552"; d.appendChild(cf); }
+      if (c === 0) { const cr = document.createElement("span"); cr.className = "coord cr";
+        cr.textContent = (rankOf(sq) + 1); cr.style.color = dark ? "#EBECD0" : "#739552"; d.appendChild(cr); }
+      sqEl.appendChild(d);
+    }
+    squaresBuilt = true;
+  }
+
+  function render() {
+    if (!squaresBuilt) buildSquares(); else relayoutSquares();
+    // highlights
+    hlEl.innerHTML = "";
+    if (state.lastMove) {
+      for (const s of state.lastMove) addHl(s, "last");
+    }
+    if (selected != null) addHlIndex(selected, "sel");
+    // dots
+    dotEl.innerHTML = "";
+    if (selected != null) {
+      const dests = destsFor(selected);
+      for (const t of dests) {
+        const dot = document.createElement("div");
+        dot.className = "dot" + (placement[t] ? " cap" : "");
+        const [l, tp] = pctPos(t); dot.style.left = l + "%"; dot.style.top = tp + "%";
+        dotEl.appendChild(dot);
+      }
+    }
+    // pieces
+    pcEl.innerHTML = "";
+    for (let sq = 0; sq < 64; sq++) {
+      const c = placement[sq];
+      if (!c) continue;
+      const [left, top] = pctPos(sq);
+      const p = document.createElement("div");
+      p.className = "pc"; p.style.left = left + "%"; p.style.top = top + "%";
+      p.dataset.sq = sq;
+      const img = document.createElement("img");
+      img.src = PIECE_URL(c); img.draggable = false;
+      img.onerror = () => { p.classList.add("fallback"); };
+      const g = document.createElement("span");
+      g.className = "g " + (c === c.toUpperCase() ? "w" : "b");
+      g.textContent = GLYPH[c];
+      p.appendChild(img); p.appendChild(g);
+      pcEl.appendChild(p);
+    }
+  }
+  function relayoutSquares() {
+    // orientation may change between renders; rebuild squares cheaply
+    buildSquares();
+  }
+  function addHl(sqNameStr, cls) {
+    const sq = nameToSq(sqNameStr); if (sq == null) return;
+    addHlIndex(sq, cls);
+  }
+  function addHlIndex(sq, cls) {
+    const el = document.createElement("div"); el.className = "hl " + cls;
+    const [l, t] = pctPos(sq); el.style.left = l + "%"; el.style.top = t + "%";
+    hlEl.appendChild(el);
+  }
+  function nameToSq(n) {
+    if (typeof n !== "string" || n.length < 2) return null;
+    const f = "abcdefgh".indexOf(n[0]); const r = parseInt(n[1], 10) - 1;
+    if (f < 0 || r < 0 || r > 7) return null; return f + r * 8;
+  }
+  function destsFor(sq) {
+    if (state.free) return [];                 // free mode shows no dots
+    const list = state.dests[sqName(sq)] || [];
+    return list.map(nameToSq).filter((x) => x != null);
+  }
+  function movable(sq) {
+    if (placement[sq] == null) return false;
+    if (state.free) return true;
+    return (state.dests[sqName(sq)] || []).length > 0;
+  }
+  function isLegal(from, to) {
+    if (state.free) return true;
+    return (state.dests[sqName(from)] || []).includes(sqName(to));
+  }
+
+  // ---- interaction (tap + drag via pointer events) ----
+  let down = null;   // {sq, x, y, pieceEl, dragging}
+  boardEl.addEventListener("pointerdown", (ev) => {
+    if (promoEl.style.display === "block") return;
+    const sq = sqFromXY(ev.clientX, ev.clientY);
+    const pieceEl = [...pcEl.children].find((c) => +c.dataset.sq === sq) || null;
+    down = { sq, x: ev.clientX, y: ev.clientY, pieceEl, dragging: false };
+    try { boardEl.setPointerCapture(ev.pointerId); } catch (e) {}
+  });
+  boardEl.addEventListener("pointermove", (ev) => {
+    if (!down) return;
+    const dx = ev.clientX - down.x, dy = ev.clientY - down.y;
+    if (!down.dragging && Math.hypot(dx, dy) > 6 && down.pieceEl && movable(down.sq)) {
+      down.dragging = true;
+      down.pieceEl.classList.add("drag");
+      if (selected !== down.sq) { selected = down.sq; render(); down.pieceEl = [...pcEl.children].find((c) => +c.dataset.sq === down.sq); down.pieceEl.classList.add("drag"); }
+    }
+    if (down.dragging && down.pieceEl) {
+      const rect = boardEl.getBoundingClientRect();
+      const size = rect.width / 8;
+      const [baseL, baseT] = pctPos(down.sq);
+      const curX = (baseL / 100) * rect.width, curY = (baseT / 100) * rect.height;
+      const tx = (ev.clientX - rect.left) - curX - size / 2;
+      const ty = (ev.clientY - rect.top) - curY - size / 2;
+      down.pieceEl.style.transform = `translate(${tx}px, ${ty}px)`;
+    }
+  });
+  boardEl.addEventListener("pointerup", (ev) => {
+    if (!down) return;
+    const upSq = sqFromXY(ev.clientX, ev.clientY);
+    const d = down; down = null;
+    if (d.pieceEl) d.pieceEl.classList.remove("drag");
+
+    if (d.dragging) {
+      if (d.pieceEl) d.pieceEl.style.transform = "";
+      if (upSq !== d.sq) { attemptMove(d.sq, upSq); }
+      else { selected = d.sq; render(); }   // tiny drag = select
+      return;
+    }
+    // tap
+    if (state.brush && state.brush !== "move") { send({ tap: sqName(upSq), id: ++moveId }); return; }
+    if (selected == null) {
+      if (movable(upSq)) { selected = upSq; render(); }
+    } else if (upSq === selected) {
+      selected = null; render();
+    } else if (isLegal(selected, upSq) || (state.free && placement[selected])) {
+      attemptMove(selected, upSq);
+    } else if (movable(upSq)) {
+      selected = upSq; render();
+    } else {
+      selected = null; render();
+    }
+  });
+  boardEl.addEventListener("pointercancel", () => {
+    if (down && down.pieceEl) { down.pieceEl.classList.remove("drag"); down.pieceEl.style.transform = ""; }
+    down = null;
+  });
+
+  function attemptMove(from, to) {
+    if (!isLegal(from, to)) { selected = null; render(); return; }
+    const pc = placement[from];
+    const toRank = rankOf(to);
+    const isPromo = !state.free && pc && pc.toLowerCase() === "p" &&
+                    ((pc === "P" && toRank === 7) || (pc === "p" && toRank === 0));
+    if (isPromo) { showPromo(from, to, pc === "P"); return; }
+    selected = null;
+    if (state.free) { placement[to] = placement[from]; placement[from] = null; render(); }
+    send({ from: sqName(from), to: sqName(to), promotion: null, id: ++moveId });
+  }
+
+  function showPromo(from, to, white) {
+    promoEl.innerHTML = "";
+    const opts = white ? ["Q", "R", "B", "N"] : ["q", "r", "b", "n"];
+    for (const o of opts) {
+      const b = document.createElement("button");
+      b.textContent = GLYPH[o]; b.style.color = white ? "#111" : "#111";
+      b.onclick = () => {
+        promoEl.style.display = "none"; selected = null;
+        send({ from: sqName(from), to: sqName(to), promotion: o.toLowerCase(), id: ++moveId });
+      };
+      promoEl.appendChild(b);
+    }
+    const [l, t] = pctPos(to);
+    promoEl.style.left = "calc(" + l + "% )"; promoEl.style.top = "calc(" + t + "% )";
+    promoEl.style.display = "block";
+  }
+
+  window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+  window.addEventListener("resize", setHeight);
+})();
+</script>
+</body>
+</html>
