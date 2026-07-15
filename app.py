@@ -18,6 +18,7 @@ import chess.svg
 import streamlit as st
 
 import auth
+import board_ui
 import coach
 import engine as engine_mod
 import fetcher
@@ -26,14 +27,6 @@ import vision
 
 st.set_page_config(page_title="Chess Coach", page_icon="♞", layout="centered")
 
-PIECE_CHOICES = {
-    "Empty": None,
-    "White pawn ♙": "P", "White knight ♘": "N", "White bishop ♗": "B",
-    "White rook ♖": "R", "White queen ♕": "Q", "White king ♔": "K",
-    "Black pawn ♟": "p", "Black knight ♞": "n", "Black bishop ♝": "b",
-    "Black rook ♜": "r", "Black queen ♛": "q", "Black king ♚": "k",
-}
-
 
 def _api_key() -> str | None:
     try:
@@ -41,6 +34,17 @@ def _api_key() -> str | None:
     except Exception:  # no secrets.toml in local dev
         key = None
     return key or st.session_state.get("api_key_input") or None
+
+
+def _gemini_key() -> str | None:
+    try:
+        return st.secrets.get("GEMINI_API_KEY", None) or None
+    except Exception:
+        return None
+
+
+def _has_llm() -> bool:
+    return bool(_api_key() or _gemini_key())
 
 
 def _default_castling(board: chess.Board) -> str:
@@ -187,7 +191,7 @@ if stage == "upload":
     uploaded = st.file_uploader("Board screenshot", type=["png", "jpg", "jpeg", "webp"])
     flipped = st.toggle("I'm playing Black (board is upside-down)", value=False)
 
-    if not _api_key():
+    if not _has_llm():
         st.text_input(
             "Anthropic API key (optional — needed for coaching text)",
             type="password", key="api_key_input",
@@ -219,11 +223,13 @@ if stage == "upload":
         st.session_state.flipped = flipped
         st.session_state.turn_white = not flipped  # crude default: it's your move
         meta = {}
-        key = _api_key()
-        if key:
+        if _has_llm():
             with st.spinner("Reading names and ratings..."):
                 try:
-                    meta = coach.extract_metadata(key, data, media_type)
+                    meta = coach.extract_metadata(
+                        data, media_type,
+                        anthropic_key=_api_key(), gemini_key=_gemini_key(),
+                    )
                 except Exception:
                     meta = {}
         st.session_state.meta = meta
@@ -269,8 +275,9 @@ if stage == "upload":
 # ---------------------------------------------------------------------------
 elif stage == "confirm":
     st.subheader("Does this match your screenshot?")
+    st.caption("Tap the board to fix any wrong squares before analysing.")
+    board_ui.edit_board("placement", st.session_state.flipped, key="confirm_edit")
     board = _board_from_confirm()
-    _render_board(board, flipped=st.session_state.flipped)
 
     meta = st.session_state.get("meta", {})
     col1, col2 = st.columns(2)
@@ -299,21 +306,7 @@ elif stage == "confirm":
         value=False,
     )
 
-    with st.expander("Fix a square"):
-        sq_col, piece_col = st.columns(2)
-        with sq_col:
-            square = st.selectbox("Square", [chess.square_name(s) for s in chess.SQUARES])
-        with piece_col:
-            piece_label = st.selectbox("Should be", list(PIECE_CHOICES))
-        if st.button("Apply fix", width="stretch"):
-            b = chess.Board.empty()
-            b.set_board_fen(st.session_state.placement)
-            sym = PIECE_CHOICES[piece_label]
-            sq = chess.parse_square(square)
-            b.set_piece_at(sq, chess.Piece.from_symbol(sym) if sym else None)
-            st.session_state.placement = b.board_fen()
-            st.rerun()
-        st.caption("Or edit the FEN directly:")
+    with st.expander("Advanced: edit FEN directly"):
         fen_edit = st.text_input("FEN placement", st.session_state.placement)
         if fen_edit != st.session_state.placement:
             try:
@@ -462,45 +455,59 @@ elif stage == "game":
         recommended = analysis.human_move_san or (
             analysis.best.move_san if analysis.best else None
         )
-    _render_board(board, arrow_san=recommended, flipped=not student_white)
+
+    st.session_state.setdefault("tap_moves", True)
+    if not game_over and st.session_state["tap_moves"]:
+        tapped = board_ui.move_board(
+            board, flipped=not student_white, key="game_board", arrow_san=recommended,
+        )
+        if tapped is not None:
+            st.session_state.appended.append(board.san(tapped))
+            _save()
+            st.rerun()
+    else:
+        _render_board(board, arrow_san=recommended, flipped=not student_white)
 
     if analysis is None and not game_over and fast_mode:
         if st.button("Analyse this position", width="stretch"):
             _run_analysis()
             st.rerun()
 
-    # --- coaching (needs an Anthropic key; everything else works without) ---
+    # --- coaching (needs an AI key; everything else works without) ---
     if not game_over and analysis:
         auto_coach = st.checkbox("Coach me automatically on my move", value=True)
-        key = _api_key()
-        if my_turn and key and (auto_coach or st.button("Coach this position")):
+        if my_turn and _has_llm() and (auto_coach or st.button("Coach this position")):
             coaching = st.session_state.coachings.get(fen)
             if coaching is None:
                 with st.spinner("Your coach is thinking..."):
                     try:
                         coaching = coach.get_coaching(
-                            key, analysis, st.session_state.my_elo,
+                            analysis, st.session_state.my_elo,
                             opponent_elo=st.session_state.opp_elo,
                             game_review=st.session_state.review or None,
+                            anthropic_key=_api_key(), gemini_key=_gemini_key(),
                         )
                         st.session_state.coachings[fen] = coaching
                     except Exception as exc:
                         st.error(f"Coaching call failed: {exc}")
             if coaching:
                 st.markdown(coaching)
-        elif my_turn and not key:
-            st.info("No Anthropic key — engine analysis and PGN export still work.")
+        elif my_turn and not _has_llm():
+            st.info("No AI key set — engine analysis and PGN export still work.")
             st.text_input("Anthropic API key", type="password", key="api_key_input")
 
     # --- move entry ---
     if not game_over:
-        st.checkbox(
-            "⚡ Fast entry — skip auto-analysis (tap Analyse when you want it)",
-            key="fast_mode",
+        opt1, opt2 = st.columns(2)
+        opt1.checkbox("Tap board to move", key="tap_moves")
+        opt2.checkbox(
+            "⚡ Fast entry", key="fast_mode",
+            help="Skip auto-analysis so you can enter moves quickly; tap "
+                 "Analyse when you want the engine.",
         )
         with st.form("move_form", clear_on_submit=True):
             move_text = st.text_input(
-                "Next move(s)",
+                "Or type move(s)",
                 placeholder="Type moves and press Enter — one or many: Nf3 d5 e4",
             )
             submitted = st.form_submit_button("Play move(s)", type="primary", width="stretch")

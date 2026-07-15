@@ -1,14 +1,30 @@
 """Coaching layer: builds an ELO-adjusted system prompt from engine facts and
-calls the Anthropic API. Claude explains; Stockfish decides. The prompt
-forbids inventing moves or evaluations beyond what the engine supplied."""
+calls an LLM to explain it. The LLM only explains; Stockfish decides. The
+prompt forbids inventing moves or evaluations beyond what the engine supplied.
+
+Two providers: Anthropic (Claude) is preferred; Google Gemini's free tier is
+the fallback used automatically when Anthropic has no key or errors (e.g. out
+of credit). Either provider alone is enough; with neither, the app still runs
+its engine analysis and PGN export."""
 
 from __future__ import annotations
 
-import anthropic
+import base64
+import json
 
 from engine import Analysis
 
-MODEL = "claude-sonnet-5"
+ANTHROPIC_MODEL = "claude-sonnet-5"
+GEMINI_MODEL = "gemini-2.0-flash"
+
+_METADATA_PROMPT = (
+    "This is a screenshot of a chess app. Extract ONLY text you can actually "
+    "read; use null for anything not visible. Reply with pure JSON, no "
+    "markdown:\n"
+    '{"bottom_username": str|null, "bottom_rating": int|null, '
+    '"top_username": str|null, "top_rating": int|null, '
+    '"site": "chess.com"|"lichess"|null, "bottom_is_white": bool|null}'
+)
 
 _PERSONAS = [
     (
@@ -116,32 +132,54 @@ Briefly mention the single most instructive one before advising on the current p
     return prompt
 
 
-def get_coaching(
-    api_key: str,
-    analysis: Analysis,
-    elo: int,
-    opponent_elo: int | None = None,
-    game_review: list[dict] | None = None,
-) -> str:
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=MODEL,
+# --- provider calls --------------------------------------------------------
+
+def _anthropic_text(key: str, system: str, user: str) -> str:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=key)
+    resp = client.messages.create(
+        model=ANTHROPIC_MODEL,
         max_tokens=1000,
-        system=build_system_prompt(elo, opponent_elo),
-        messages=[{"role": "user", "content": build_user_prompt(analysis, game_review)}],
+        system=system,
+        messages=[{"role": "user", "content": user}],
     )
-    return response.content[0].text
+    return resp.content[0].text
 
 
-def extract_metadata(api_key: str, image_bytes: bytes, media_type: str) -> dict:
-    """One vision call to read usernames, ratings and clock state from the
-    screenshot. Text extraction only — piece placement is the CNN's job."""
-    import base64
-    import json
+def _gemini_generate(key: str, parts: list[dict], system: str | None, max_tokens: int) -> str:
+    """Call the Gemini REST API directly (no SDK - the google SDKs pin an old
+    protobuf that clashes with TensorFlow's, breaking the board reader)."""
+    import requests
 
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=MODEL,
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    body: dict = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"maxOutputTokens": max_tokens},
+    }
+    if system:
+        body["system_instruction"] = {"parts": [{"text": system}]}
+    resp = requests.post(url, params={"key": key}, json=body, timeout=45)
+    resp.raise_for_status()
+    data = resp.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {data.get('promptFeedback', data)}")
+    return "".join(
+        p.get("text", "") for p in candidates[0]["content"]["parts"]
+    ).strip()
+
+
+def _gemini_text(key: str, system: str, user: str) -> str:
+    return _gemini_generate(key, [{"text": user}], system=system, max_tokens=1000)
+
+
+def _anthropic_vision(key: str, image_bytes: bytes, media_type: str, prompt: str) -> str:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=key)
+    resp = client.messages.create(
+        model=ANTHROPIC_MODEL,
         max_tokens=300,
         messages=[{
             "role": "user",
@@ -154,25 +192,85 @@ def extract_metadata(api_key: str, image_bytes: bytes, media_type: str) -> dict:
                         "data": base64.standard_b64encode(image_bytes).decode(),
                     },
                 },
-                {
-                    "type": "text",
-                    "text": (
-                        "This is a screenshot of a chess app. Extract ONLY text you "
-                        "can actually read; use null for anything not visible. Reply "
-                        "with pure JSON, no markdown:\n"
-                        '{"bottom_username": str|null, "bottom_rating": int|null, '
-                        '"top_username": str|null, "top_rating": int|null, '
-                        '"site": "chess.com"|"lichess"|null, '
-                        '"bottom_is_white": bool|null}'
-                    ),
-                },
+                {"type": "text", "text": prompt},
             ],
         }],
     )
-    text = response.content[0].text.strip()
+    return resp.content[0].text
+
+
+def _gemini_vision(key: str, image_bytes: bytes, media_type: str, prompt: str) -> str:
+    parts = [
+        {"inline_data": {
+            "mime_type": media_type,
+            "data": base64.standard_b64encode(image_bytes).decode(),
+        }},
+        {"text": prompt},
+    ]
+    return _gemini_generate(key, parts, system=None, max_tokens=300)
+
+
+# --- public API ------------------------------------------------------------
+
+def get_coaching(
+    analysis: Analysis,
+    elo: int,
+    opponent_elo: int | None = None,
+    game_review: list[dict] | None = None,
+    anthropic_key: str | None = None,
+    gemini_key: str | None = None,
+) -> str:
+    """Coach the current position. Tries Anthropic, then Gemini. Raises if
+    neither provider is configured or both fail."""
+    system = build_system_prompt(elo, opponent_elo)
+    user = build_user_prompt(analysis, game_review)
+    errors = []
+    if anthropic_key:
+        try:
+            return _anthropic_text(anthropic_key, system, user)
+        except Exception as exc:  # e.g. out of credit -> fall through to Gemini
+            errors.append(f"Anthropic: {exc}")
+    if gemini_key:
+        try:
+            return _gemini_text(gemini_key, system, user)
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
+    raise RuntimeError(
+        "No coaching provider available. " + (" ; ".join(errors) or "Add an API key.")
+    )
+
+
+def _parse_metadata(text: str) -> dict:
+    text = text.strip()
     if text.startswith("```"):
         text = text.strip("`").removeprefix("json").strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         return {}
+
+
+def extract_metadata(
+    image_bytes: bytes,
+    media_type: str,
+    anthropic_key: str | None = None,
+    gemini_key: str | None = None,
+) -> dict:
+    """Read usernames, ratings and clock state from the screenshot. Text
+    extraction only — piece placement is the CNN's job. Tries Anthropic, then
+    Gemini; returns {} if neither is available or both fail."""
+    if anthropic_key:
+        try:
+            return _parse_metadata(
+                _anthropic_vision(anthropic_key, image_bytes, media_type, _METADATA_PROMPT)
+            )
+        except Exception:
+            pass
+    if gemini_key:
+        try:
+            return _parse_metadata(
+                _gemini_vision(gemini_key, image_bytes, media_type, _METADATA_PROMPT)
+            )
+        except Exception:
+            pass
+    return {}
