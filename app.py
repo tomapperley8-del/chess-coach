@@ -11,6 +11,7 @@ without an Anthropic key the engine analysis and PGN export still work.
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import chess
@@ -24,6 +25,8 @@ import engine as engine_mod
 import fetcher
 import gamestore
 import vision
+
+importlib.reload(chessboard)
 
 PROMO_MAP = {"q": chess.QUEEN, "r": chess.ROOK, "b": chess.BISHOP, "n": chess.KNIGHT}
 ADD_PIECES = {
@@ -513,18 +516,14 @@ elif stage == "game":
 
     # --- board (game_mode: moves handled locally in JS, no reload per move) ---
     if not game_over:
-        try:
-            res = chessboard.show_board(
-                fen,
-                game_mode=True,
-                flush=flush_requested,
-                orientation=orientation,
-                last_move=chessboard.last_move_squares(board),
-                key="game_board",
-            )
-        except TypeError as exc:
-            st.error(f"Board error: {exc}")
-            res = None
+        res = chessboard.show_board(
+            fen,
+            game_mode=True,
+            flush=flush_requested,
+            orientation=orientation,
+            last_move=chessboard.last_move_squares(board),
+            key="game_board",
+        )
         # Process flushed moves from the component
         if res and res.get("moves"):
             new_moves = res["moves"]
