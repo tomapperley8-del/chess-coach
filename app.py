@@ -39,7 +39,7 @@ st.set_page_config(page_title="Chess Coach", page_icon="♞", layout="centered")
 def _api_key() -> str | None:
     try:
         key = st.secrets.get("ANTHROPIC_API_KEY", None)
-    except Exception:  # no secrets.toml in local dev
+    except Exception:
         key = None
     return key or st.session_state.get("api_key_input") or None
 
@@ -131,7 +131,7 @@ def _save():
     try:
         gamestore.save_game(st.session_state.user, st.session_state.game_id, _current_pgn())
     except OSError:
-        pass  # read-only filesystem is fine; download still works
+        pass
 
 
 def _start_game(start_fen, prefix, headers, review, game_name):
@@ -153,8 +153,6 @@ def _start_game(start_fen, prefix, headers, review, game_name):
 
 
 def _resume_saved(path: str) -> bool:
-    """Load a saved PGN into a fresh live-game session. Returns False if the
-    file couldn't be read."""
     loaded = gamestore.load_game(path)
     if loaded is None:
         return False
@@ -224,12 +222,12 @@ if stage == "upload":
             try:
                 image = vision.image_from_bytes(data)
                 placement, board_img = vision.screenshot_to_placement(image, flipped=flipped)
-            except Exception as exc:  # surface, don't crash: user can retry
+            except Exception as exc:
                 st.error(f"Couldn't read the board: {exc}")
                 st.stop()
         st.session_state.placement = placement
         st.session_state.flipped = flipped
-        st.session_state.turn_white = not flipped  # crude default: it's your move
+        st.session_state.turn_white = not flipped
         meta = {}
         if _has_llm():
             with st.spinner("Reading names and ratings..."):
@@ -244,11 +242,44 @@ if stage == "upload":
         st.session_state.stage = "confirm"
         st.rerun()
 
+    # --- Start from standard position (no screenshot needed) ---
+    st.divider()
+    st.subheader("Or start from scratch")
+    game_name_scratch = st.text_input(
+        "Name this game", key="scratch_name",
+        placeholder="e.g. vs Dave — Tuesday blitz",
+    ).strip()
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        scratch_side = st.radio("Which side are you?", ["White", "Black"],
+                                horizontal=True, key="scratch_side")
+    with sc2:
+        scratch_elo = st.number_input("Your rating", 100, 3200, 800, step=50,
+                                      key="scratch_elo")
+    scratch_white = scratch_side == "White"
+    if game_name_scratch:
+        if gamestore.name_taken(username, game_name_scratch):
+            st.warning(f'You already have a game called "{game_name_scratch}".')
+        elif st.button("Start game", type="primary", width="stretch"):
+            st.session_state.student_white = scratch_white
+            st.session_state.flipped = not scratch_white
+            st.session_state.my_elo = scratch_elo
+            st.session_state.opp_elo = 800
+            headers = {
+                "white": "Me" if scratch_white else "Opponent",
+                "black": "Opponent" if scratch_white else "Me",
+                "student_side": "white" if scratch_white else "black",
+                "whiteelo": scratch_elo if scratch_white else 800,
+                "blackelo": 800 if scratch_white else scratch_elo,
+            }
+            _start_game(None, [], headers, [], game_name_scratch)
+            st.rerun()
+
+    # --- Saved games ---
     saved = gamestore.list_saved(username)
     if saved:
         st.divider()
         st.caption("Jump straight back into a game:")
-        # Quick-select: one tap resumes the most recent games.
         for path in saved[:6]:
             name = os.path.splitext(os.path.basename(path))[0]
             if st.button(f"▶  {name}", key=f"quick_{path}", width="stretch"):
@@ -373,7 +404,7 @@ elif stage == "confirm":
         st.button("Looks right — start coaching", type="primary",
                   width="stretch", disabled=True)
     elif gamestore.name_taken(username, game_name):
-        st.warning(f"You already have a game called “{game_name}”. Pick another name.")
+        st.warning(f'You already have a game called "{game_name}". Pick another name.')
     else:
         if st.button("Looks right — start coaching", type="primary", width="stretch"):
             st.session_state.my_elo = my_elo
@@ -442,22 +473,29 @@ elif stage == "game":
     my_turn = board.turn == student_white
     game_over = board.is_game_over()
     h = st.session_state.headers
+    flipped = st.session_state.get("flipped", not student_white)
 
-    fast_mode = st.session_state.get("fast_mode", False)
+    # --- game name + one-tap switcher ---
+    gcol1, gcol2 = st.columns([3, 1])
+    with gcol1:
+        st.subheader(f"♟ {st.session_state.game_id}")
+    with gcol2:
+        if st.button("🔄 Flip", key="flip_board", use_container_width=True):
+            st.session_state.flipped = not flipped
+            st.rerun()
 
-    # --- game name + one-tap switcher (no need to go via "New game" first) ---
-    st.subheader(f"♟ {st.session_state.game_id}")
     _paths = gamestore.list_saved(username)
     _names = [os.path.splitext(os.path.basename(p))[0] for p in _paths]
-    if st.session_state.game_id not in _names:      # not yet on disk
+    if st.session_state.game_id not in _names:
         _names.insert(0, st.session_state.game_id)
         _paths.insert(0, None)
-    _NEW = "➕ New game (upload a screenshot)"
+    _NEW_SCREENSHOT = "📷 New game (upload a screenshot)"
+    _NEW_SCRATCH = "♟ New game (from scratch)"
     _choice = st.selectbox(
-        "Switch game", _names + [_NEW],
+        "Switch game", _names + [_NEW_SCRATCH, _NEW_SCREENSHOT],
         index=_names.index(st.session_state.game_id), key="game_switch",
     )
-    if _choice == _NEW:
+    if _choice == _NEW_SCREENSHOT or _choice == _NEW_SCRATCH:
         _reset()
         st.rerun()
     elif _choice != st.session_state.game_id:
@@ -467,8 +505,50 @@ elif stage == "game":
         else:
             st.error("Couldn't open that game.")
 
-    # --- persistent status line, shown above the board at all times ---
-    status_line = st.empty()
+    # --- orientation ---
+    orientation = "black" if flipped else "white"
+
+    # --- flush mechanism: sync local moves from the board component ---
+    flush_requested = st.session_state.pop("_flush_moves", False)
+
+    # --- board (game_mode: moves handled locally in JS, no reload per move) ---
+    if not game_over:
+        res = chessboard.show_board(
+            fen,
+            game_mode=True,
+            flush=flush_requested,
+            orientation=orientation,
+            last_move=chessboard.last_move_squares(board),
+            key="game_board",
+        )
+        # Process flushed moves from the component
+        if res and res.get("moves"):
+            new_moves = res["moves"]
+            b2 = board.copy()
+            for san in new_moves:
+                try:
+                    b2.push_san(san)
+                except ValueError:
+                    break
+                st.session_state.appended.append(san)
+            _save()
+            board = _current_board()
+            fen = board.fen()
+            ply = len(st.session_state.prefix) + len(st.session_state.appended)
+            game_over = board.is_game_over()
+            my_turn = board.turn == student_white
+    else:
+        _render_board(board, flipped=flipped)
+
+    # --- status line ---
+    if game_over:
+        st.success(f"Game over: {board.result()}")
+    else:
+        base = f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number}"
+        st.caption(base)
+
+    # --- analyse / coaching controls ---
+    analysis = st.session_state.analyses.get(fen)
 
     def _run_analysis():
         with st.spinner("Analysing with Stockfish..."):
@@ -479,7 +559,6 @@ elif stage == "game":
                 st.stop()
         st.session_state.analyses[fen] = a
         st.session_state.evals[ply] = engine_mod.white_cp(a)
-        # If this position follows a live-entered move, log it for the review.
         if (
             st.session_state.appended
             and ply not in st.session_state.reviewed
@@ -501,70 +580,44 @@ elif stage == "game":
                 "fen_after": fen,
             })
             st.session_state.reviewed.add(ply)
-            _save()  # so blunder notes land in the saved PGN
+            _save()
         return a
 
-    # In fast-entry mode the engine call is skipped so moves can be punched in
-    # quickly; analysis (and coaching) then run only when explicitly asked.
-    analysis = st.session_state.analyses.get(fen)
-    if analysis is None and not game_over and not fast_mode:
+    if not game_over:
+        acol1, acol2 = st.columns([1, 1])
+        with acol1:
+            if st.button("🔍 Analyse & sync", type="primary", use_container_width=True):
+                st.session_state["_flush_moves"] = True
+                st.rerun()
+        with acol2:
+            if st.button("↩️ Undo last move", use_container_width=True,
+                         disabled=not st.session_state.appended):
+                st.session_state.appended.pop()
+                _save()
+                st.rerun()
+
+    # If we have the position analysed (from a previous sync), show results
+    if analysis is None and flush_requested and not game_over:
         analysis = _run_analysis()
 
-    turn_label = "Your move" if my_turn else "Waiting for opponent's move"
-    if game_over:
-        status_line.success(f"Game over: {board.result()}")
-    else:
-        base = f"{h.get('white')} vs {h.get('black')} — move {board.fullmove_number} · {turn_label}"
-        status_line.caption(
-            base + (f" · Engine eval: {analysis.eval_text()}" if analysis else "")
-        )
-
-    # --- automatic complexity flag: warn when a human is likely to go wrong ---
     if analysis and not game_over:
+        # complexity flag
         level, message = engine_mod.assess_complexity(analysis)
         if level == "critical":
             st.warning("⚠️ " + message)
         elif level == "sharp":
             st.info("♟ " + message)
 
-    recommended = None
-    if analysis and my_turn and not game_over:
-        recommended = analysis.human_move_san or (
-            analysis.best.move_san if analysis.best else None
-        )
-
-    if not game_over:
-        res = chessboard.show_board(
-            fen,
-            dests=chessboard.legal_dests(board),
-            orientation="white" if student_white else "black",
-            last_move=chessboard.last_move_squares(board),
-            key="game_board",
-        )
+        recommended = None
+        if my_turn:
+            recommended = analysis.human_move_san or (
+                analysis.best.move_san if analysis.best else None
+            )
         if recommended:
             st.caption(f"💡 Suggested move: **{recommended}**")
-        if res and res.get("id") != st.session_state.get("_game_move_id"):
-            st.session_state["_game_move_id"] = res["id"]
-            frm, to = res.get("from"), res.get("to")
-            if frm and to:
-                mv = chess.Move(
-                    chess.parse_square(frm), chess.parse_square(to),
-                    promotion=PROMO_MAP.get(res.get("promotion")),
-                )
-                if mv in board.legal_moves:
-                    st.session_state.appended.append(board.san(mv))
-                    _save()
-                    st.rerun()
-    else:
-        _render_board(board, flipped=not student_white)
+        st.caption(f"Engine eval: {analysis.eval_text()}")
 
-    if analysis is None and not game_over and fast_mode:
-        if st.button("Analyse this position", width="stretch"):
-            _run_analysis()
-            st.rerun()
-
-    # --- coaching (needs an AI key; everything else works without) ---
-    if not game_over and analysis:
+        # coaching
         c_opt, c_prov = st.columns([1, 1])
         auto_coach = c_opt.checkbox("Coach me automatically", value=True)
         with c_prov:
@@ -599,55 +652,44 @@ elif stage == "game":
             st.info("No AI key set — engine analysis and PGN export still work.")
             st.text_input("Anthropic API key", type="password", key="api_key_input")
 
-    # --- move entry: drag/tap on the board above, or type here ---
+    # --- typed move entry (fallback — the board handles moves in JS now) ---
     if not game_over:
-        st.checkbox(
-            "⚡ Fast entry", key="fast_mode",
-            help="Skip auto-analysis so you can enter moves quickly; tap "
-                 "Analyse when you want the engine.",
-        )
-        with st.form("move_form", clear_on_submit=True):
-            move_text = st.text_input(
-                "Or type move(s)",
-                placeholder="Type moves and press Enter — one or many: Nf3 d5 e4",
-            )
-            submitted = st.form_submit_button("Play move(s)", type="primary", width="stretch")
-        if submitted and move_text.strip():
-            tokens = move_text.replace(",", " ").split()
-            b2 = board.copy()
-            new_sans = []
-            error = None
-            for token in tokens:
-                try:
-                    move = b2.parse_san(token)
-                except ValueError:
+        with st.expander("Type moves manually"):
+            with st.form("move_form", clear_on_submit=True):
+                move_text = st.text_input(
+                    "Type move(s)",
+                    placeholder="e.g. Nf3 d5 e4",
+                )
+                submitted = st.form_submit_button("Play move(s)", type="primary", width="stretch")
+            if submitted and move_text.strip():
+                tokens = move_text.replace(",", " ").split()
+                b2 = board.copy()
+                new_sans = []
+                error = None
+                for token in tokens:
                     try:
-                        move = b2.parse_uci(token.lower())
+                        move = b2.parse_san(token)
                     except ValueError:
-                        error = f"'{token}' isn't a legal move here."
-                        break
-                new_sans.append(b2.san(move))
-                b2.push(move)
-            if error:
-                st.error(error)
-            else:
-                st.session_state.appended.extend(new_sans)
-                _save()
-                st.rerun()
+                        try:
+                            move = b2.parse_uci(token.lower())
+                        except ValueError:
+                            error = f"'{token}' isn't a legal move here."
+                            break
+                    new_sans.append(b2.san(move))
+                    b2.push(move)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state.appended.extend(new_sans)
+                    _save()
+                    st.rerun()
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Undo last move", width="stretch",
-                     disabled=not st.session_state.appended):
-            st.session_state.appended.pop()
-            _save()
-            st.rerun()
-    with col_b:
-        st.download_button(
-            "Download PGN", _current_pgn(),
-            file_name=f"{st.session_state.game_id}.pgn",
-            mime="application/x-chess-pgn", width="stretch",
-        )
+    # --- PGN download ---
+    st.download_button(
+        "Download PGN", _current_pgn(),
+        file_name=f"{st.session_state.game_id}.pgn",
+        mime="application/x-chess-pgn", width="stretch",
+    )
 
     with st.expander("Rename this game"):
         new_id = st.text_input(

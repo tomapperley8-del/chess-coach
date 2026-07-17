@@ -10,6 +10,7 @@
     --sel: #f7ec74;
     --last: rgba(247, 236, 116, 0.55);
     --dot: rgba(20, 20, 20, 0.16);
+    --check: radial-gradient(ellipse at center, rgba(255,0,0,0.6) 0%, rgba(255,0,0,0) 70%);
   }
   * { box-sizing: border-box; -webkit-user-select: none; user-select: none;
       -webkit-tap-highlight-color: transparent; }
@@ -27,6 +28,7 @@
   .hl { position: absolute; width: 12.5%; height: 12.5%; z-index: 1; }
   .hl.last { background: var(--last); }
   .hl.sel  { box-shadow: inset 0 0 0 4px var(--sel); }
+  .hl.check { background: var(--check); }
   .dot { position: absolute; width: 12.5%; height: 12.5%; z-index: 2;
          display: flex; align-items: center; justify-content: center; pointer-events: none; }
   .dot::after { content: ""; width: 30%; height: 30%; border-radius: 50%; background: var(--dot); }
@@ -47,6 +49,8 @@
   #promo button { display: block; width: 56px; height: 56px; border: none; background: #fff;
                   font-size: 40px; cursor: pointer; line-height: 1; }
   #promo button:hover { background: #dbeafe; }
+  #status { text-align: center; font-size: 13px; padding: 4px 0; color: #555;
+            min-height: 22px; }
 </style>
 </head>
 <body>
@@ -58,8 +62,14 @@
     <div id="pieces" class="layer" style="z-index:4"></div>
     <div id="promo"></div>
   </div>
+  <div id="status"></div>
 </div>
+<script src="chess.js"></script>
 <script>
+window.onerror = function(msg, url, line, col, err) {
+  document.getElementById("status").textContent = "JS Error: " + msg + " (line " + line + ")";
+};
+try {
 (function () {
   const GLYPH = { P:"♙", N:"♘", B:"♗", R:"♖", Q:"♕", K:"♔",
                   p:"♟", n:"♞", b:"♝", r:"♜", q:"♛", k:"♚" };
@@ -75,13 +85,21 @@
   const dotEl    = document.getElementById("dots");
   const pcEl     = document.getElementById("pieces");
   const promoEl  = document.getElementById("promo");
+  const statusEl = document.getElementById("status");
 
   let state = { fen: null, dests: {}, orientation: "white", lastMove: null,
                 free: false, brush: "move" };
-  let placement = [];        // 64 entries, piece char or null, index = file + rank*8
-  let selected = null;       // square index or null
+  let placement = [];
+  let selected = null;
   let moveId = 0;
   let squaresBuilt = false;
+
+  // ---- Game mode state (chess.js powered) ----
+  let gameMode = false;
+  let chess = null;          // Chess() instance
+  let localMoves = [];       // SAN strings accumulated locally
+  let baseFen = null;        // FEN that Python knows about
+  let lastMoveLocal = null;  // [from, to] square names for highlight
 
   // ---- Streamlit protocol ----
   function send(value) {
@@ -94,25 +112,155 @@
     window.parent.postMessage(
       { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*");
   }
+
   window.addEventListener("message", (e) => {
     if (!e.data || e.data.type !== "streamlit:render") return;
     const a = e.data.args || {};
+    gameMode = !!a.game_mode;
+
+    if (gameMode) {
+      handleGameModeRender(a);
+    } else {
+      handleNormalRender(a);
+    }
+    setHeight();
+  });
+
+  function handleNormalRender(a) {
+    statusEl.textContent = "";
     state.fen = a.fen; state.dests = a.dests || {}; state.orientation = a.orientation || "white";
     state.lastMove = a.last_move || null; state.free = !!a.free; state.brush = a.brush || "move";
     selected = null;
+    chess = null; localMoves = []; baseFen = null; lastMoveLocal = null;
     parseFen(state.fen);
     render();
-    setHeight();
-  });
+  }
+
+  function handleGameModeRender(a) {
+    state.free = false;
+    state.brush = "move";
+    state.orientation = a.orientation || "white";
+
+    var incomingFen = a.fen;
+
+    // Initialize or reset chess.js when the base position changes
+    if (!chess || baseFen !== incomingFen) {
+      // Python sent a new base FEN (first render, undo, or game switch)
+      chess = new Chess(incomingFen);
+      localMoves = [];
+      baseFen = incomingFen;
+      lastMoveLocal = a.last_move || null;
+    }
+
+    // Flush: Python wants our accumulated moves
+    if (a.flush && localMoves.length > 0) {
+      send({ moves: localMoves.slice(), fen: chess.fen(), id: ++moveId });
+      // After flush, Python will rerun with updated baseFen
+      return;
+    }
+
+    // Undo request: Python may send undo_count
+    if (a.undo_count && a.undo_count > 0) {
+      for (var u = 0; u < a.undo_count; u++) {
+        if (localMoves.length > 0) {
+          chess.undo();
+          localMoves.pop();
+        }
+      }
+      // Update last move highlight
+      var hist = chess.history({ verbose: true });
+      if (hist.length > 0) {
+        var last = hist[hist.length - 1];
+        lastMoveLocal = [last.from, last.to];
+      } else {
+        lastMoveLocal = a.last_move || null;
+      }
+    }
+
+    // Compute legal dests from chess.js
+    state.dests = computeDestsFromChess();
+    state.lastMove = lastMoveLocal;
+
+    parseFen(chess.fen());
+    selected = null;
+
+    updateStatus();
+    render();
+  }
+
+  function computeDestsFromChess() {
+    if (!chess) return {};
+    var dests = {};
+    var moves = chess.moves({ verbose: true });
+    for (var i = 0; i < moves.length; i++) {
+      var m = moves[i];
+      if (!dests[m.from]) dests[m.from] = [];
+      if (dests[m.from].indexOf(m.to) === -1) dests[m.from].push(m.to);
+    }
+    return dests;
+  }
+
+  function updateStatus() {
+    if (!chess) { statusEl.textContent = ""; return; }
+    if (chess.in_checkmate()) {
+      var winner = chess.turn() === "w" ? "Black" : "White";
+      statusEl.textContent = "Checkmate — " + winner + " wins";
+    } else if (chess.in_stalemate()) {
+      statusEl.textContent = "Stalemate — draw";
+    } else if (chess.in_draw()) {
+      statusEl.textContent = "Draw";
+    } else if (chess.in_check()) {
+      statusEl.textContent = (chess.turn() === "w" ? "White" : "Black") + " is in check";
+    } else {
+      var moveNum = Math.ceil((chess.history().length + 1) / 2);
+      statusEl.textContent = "Move " + moveNum + " — " + (chess.turn() === "w" ? "White" : "Black") + " to play";
+    }
+  }
+
+  function gameAttemptMove(from, to, promo) {
+    var result = chess.move({ from: sqName(from), to: sqName(to), promotion: promo || undefined });
+    if (result) {
+      localMoves.push(result.san);
+      lastMoveLocal = [result.from, result.to];
+      state.dests = computeDestsFromChess();
+      state.lastMove = lastMoveLocal;
+      parseFen(chess.fen());
+      selected = null;
+      updateStatus();
+      render();
+      return true;
+    }
+    return false;
+  }
+
+  function gameUndoOne() {
+    if (localMoves.length === 0) return;
+    chess.undo();
+    localMoves.pop();
+    var hist = chess.history({ verbose: true });
+    if (hist.length > 0) {
+      var last = hist[hist.length - 1];
+      lastMoveLocal = [last.from, last.to];
+    } else {
+      lastMoveLocal = null;
+    }
+    state.dests = computeDestsFromChess();
+    state.lastMove = lastMoveLocal;
+    parseFen(chess.fen());
+    selected = null;
+    updateStatus();
+    render();
+  }
 
   // ---- helpers ----
   function parseFen(fen) {
     placement = new Array(64).fill(null);
-    const rows = fen.split(" ")[0].split("/");   // rank 8 first
-    for (let r = 0; r < 8; r++) {
-      const rank = 7 - r;
-      let file = 0;
-      for (const ch of rows[r]) {
+    var rows = fen.split(" ")[0].split("/");
+    for (var r = 0; r < 8; r++) {
+      var rank = 7 - r;
+      var file = 0;
+      for (var ci = 0; ci < rows[r].length; ci++) {
+        var ch = rows[r][ci];
         if (/\d/.test(ch)) { file += parseInt(ch, 10); }
         else { placement[file + rank * 8] = ch; file++; }
       }
@@ -141,7 +289,7 @@
     for (let sq = 0; sq < 64; sq++) {
       const [left, top] = pctPos(sq);
       const d = document.createElement("div");
-      const dark = (fileOf(sq) + rankOf(sq)) % 2 === 0;   // a1 dark
+      const dark = (fileOf(sq) + rankOf(sq)) % 2 === 0;
       d.className = "sq " + (dark ? "d" : "l");
       d.style.left = left + "%"; d.style.top = top + "%";
       const [c, rw] = colRow(sq);
@@ -154,14 +302,25 @@
     squaresBuilt = true;
   }
 
+  function findKingSq(color) {
+    var k = color === "w" ? "K" : "k";
+    for (var i = 0; i < 64; i++) { if (placement[i] === k) return i; }
+    return null;
+  }
+
   function render() {
-    if (!squaresBuilt) buildSquares(); else relayoutSquares();
+    if (!squaresBuilt) buildSquares(); else buildSquares();
     // highlights
     hlEl.innerHTML = "";
     if (state.lastMove) {
       for (const s of state.lastMove) addHl(s, "last");
     }
     if (selected != null) addHlIndex(selected, "sel");
+    // check highlight
+    if (gameMode && chess && chess.in_check()) {
+      var kSq = findKingSq(chess.turn());
+      if (kSq != null) addHlIndex(kSq, "check");
+    }
     // dots
     dotEl.innerHTML = "";
     if (selected != null) {
@@ -192,10 +351,7 @@
       pcEl.appendChild(p);
     }
   }
-  function relayoutSquares() {
-    // orientation may change between renders; rebuild squares cheaply
-    buildSquares();
-  }
+
   function addHl(sqNameStr, cls) {
     const sq = nameToSq(sqNameStr); if (sq == null) return;
     addHlIndex(sq, cls);
@@ -211,7 +367,7 @@
     if (f < 0 || r < 0 || r > 7) return null; return f + r * 8;
   }
   function destsFor(sq) {
-    if (state.free) return [];                 // free mode shows no dots
+    if (state.free) return [];
     const list = state.dests[sqName(sq)] || [];
     return list.map(nameToSq).filter((x) => x != null);
   }
@@ -226,9 +382,10 @@
   }
 
   // ---- interaction (tap + drag via pointer events) ----
-  let down = null;   // {sq, x, y, pieceEl, dragging}
+  let down = null;
   boardEl.addEventListener("pointerdown", (ev) => {
     if (promoEl.style.display === "block") return;
+    if (gameMode && chess && chess.game_over()) return;
     const sq = sqFromXY(ev.clientX, ev.clientY);
     const pieceEl = [...pcEl.children].find((c) => +c.dataset.sq === sq) || null;
     down = { sq, x: ev.clientX, y: ev.clientY, pieceEl, dragging: false };
@@ -261,7 +418,7 @@
     if (d.dragging) {
       if (d.pieceEl) d.pieceEl.style.transform = "";
       if (upSq !== d.sq) { attemptMove(d.sq, upSq); }
-      else { selected = d.sq; render(); }   // tiny drag = select
+      else { selected = d.sq; render(); }
       return;
     }
     // tap
@@ -284,6 +441,18 @@
   });
 
   function attemptMove(from, to) {
+    if (gameMode) {
+      // In game mode, check if it's a promotion
+      const pc = placement[from];
+      const toRank = rankOf(to);
+      const isPromo = pc && pc.toLowerCase() === "p" &&
+                    ((pc === "P" && toRank === 7) || (pc === "p" && toRank === 0));
+      if (isPromo) { showPromo(from, to, pc === "P"); return; }
+      if (gameAttemptMove(from, to, null)) return;
+      selected = null; render();
+      return;
+    }
+    // Normal mode
     if (!isLegal(from, to)) { selected = null; render(); return; }
     const pc = placement[from];
     const toRank = rankOf(to);
@@ -300,10 +469,14 @@
     const opts = white ? ["Q", "R", "B", "N"] : ["q", "r", "b", "n"];
     for (const o of opts) {
       const b = document.createElement("button");
-      b.textContent = GLYPH[o]; b.style.color = white ? "#111" : "#111";
+      b.textContent = GLYPH[o]; b.style.color = "#111";
       b.onclick = () => {
         promoEl.style.display = "none"; selected = null;
-        send({ from: sqName(from), to: sqName(to), promotion: o.toLowerCase(), id: ++moveId });
+        if (gameMode) {
+          gameAttemptMove(from, to, o.toLowerCase());
+        } else {
+          send({ from: sqName(from), to: sqName(to), promotion: o.toLowerCase(), id: ++moveId });
+        }
       };
       promoEl.appendChild(b);
     }
@@ -315,6 +488,7 @@
   window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
   window.addEventListener("resize", setHeight);
 })();
+} catch(e) { document.getElementById("status").textContent = "IIFE Error: " + e.message; }
 </script>
 </body>
 </html>

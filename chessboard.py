@@ -6,6 +6,11 @@ self-contained HTML/JS component. It returns the move the user made:
   {"tap": "e4", "id": n}                                    (edit paint tap)
 `id` increments per interaction so repeat moves still register; the caller
 dedupes on it.
+
+In game_mode, the component uses chess.js to handle moves locally — no server
+round-trip per move. Moves accumulate in JS and are flushed to Python on demand
+(when flush=True is passed). The component returns:
+  {"moves": ["e4", "d5", ...], "fen": "...", "id": n}
 """
 
 from __future__ import annotations
@@ -44,6 +49,9 @@ def show_board(
     last_move: list[str] | None = None,
     free: bool = False,
     brush: str = "move",
+    game_mode: bool = False,
+    flush: bool = False,
+    undo_count: int = 0,
     key: str,
 ):
     return _component(
@@ -53,6 +61,9 @@ def show_board(
         last_move=last_move,
         free=free,
         brush=brush,
+        game_mode=game_mode,
+        flush=flush,
+        undo_count=undo_count,
         key=key,
         default=None,
     )
