@@ -219,6 +219,37 @@ def _gemini_vision(key: str, image_bytes: bytes, media_type: str, prompt: str) -
 
 # --- public API ------------------------------------------------------------
 
+PROVIDERS = {
+    "auto": "Auto (Claude, then Gemini)",
+    "anthropic": "Claude only",
+    "gemini": "Gemini only",
+}
+
+
+def short_error(exc: Exception) -> str:
+    """A one-line, human-readable reason instead of a raw traceback."""
+    text = str(exc)
+    low = text.lower()
+    if "429" in text or "resource_exhausted" in low or "rate" in low:
+        return "rate limit / quota reached"
+    if "401" in text or "authentication" in low or "api key" in low or "invalid_argument" in low:
+        return "API key rejected"
+    if "credit" in low or "billing" in low or "quota" in low:
+        return "out of credit"
+    if "timeout" in low or "timed out" in low:
+        return "timed out"
+    return text[:120]
+
+
+def _order(provider: str, anthropic_key, gemini_key) -> list[tuple[str, str]]:
+    chain = []
+    if provider in ("auto", "anthropic") and anthropic_key:
+        chain.append(("Claude", anthropic_key))
+    if provider in ("auto", "gemini") and gemini_key:
+        chain.append(("Gemini", gemini_key))
+    return chain
+
+
 def get_coaching(
     analysis: Analysis,
     elo: int,
@@ -226,25 +257,25 @@ def get_coaching(
     game_review: list[dict] | None = None,
     anthropic_key: str | None = None,
     gemini_key: str | None = None,
+    provider: str = "auto",
 ) -> str:
-    """Coach the current position. Tries Anthropic, then Gemini. Raises if
-    neither provider is configured or both fail."""
+    """Coach the current position.
+
+    provider: "auto" (Claude then Gemini), "anthropic", or "gemini".
+    Raises RuntimeError with a short reason if the chosen provider(s) fail."""
     system = build_system_prompt(elo, opponent_elo)
     user = build_user_prompt(analysis, game_review)
+    chain = _order(provider, anthropic_key, gemini_key)
+    if not chain:
+        raise RuntimeError("no API key set for the selected coach")
     errors = []
-    if anthropic_key:
+    for name, key in chain:
         try:
-            return _anthropic_text(anthropic_key, system, user)
-        except Exception as exc:  # e.g. out of credit -> fall through to Gemini
-            errors.append(f"Anthropic: {exc}")
-    if gemini_key:
-        try:
-            return _gemini_text(gemini_key, system, user)
+            fn = _anthropic_text if name == "Claude" else _gemini_text
+            return fn(key, system, user)
         except Exception as exc:
-            errors.append(f"Gemini: {exc}")
-    raise RuntimeError(
-        "No coaching provider available. " + (" ; ".join(errors) or "Add an API key.")
-    )
+            errors.append(f"{name}: {short_error(exc)}")
+    raise RuntimeError("; ".join(errors))
 
 
 def _parse_metadata(text: str) -> dict:
@@ -262,22 +293,16 @@ def extract_metadata(
     media_type: str,
     anthropic_key: str | None = None,
     gemini_key: str | None = None,
+    provider: str = "auto",
 ) -> dict:
     """Read usernames, ratings and clock state from the screenshot. Text
-    extraction only — piece placement is the CNN's job. Tries Anthropic, then
-    Gemini; returns {} if neither is available or both fail."""
-    if anthropic_key:
+    extraction only — piece placement is the CNN's job. Returns {} if the
+    chosen provider(s) are unavailable or fail; ratings can be typed by hand,
+    so this never raises."""
+    for name, key in _order(provider, anthropic_key, gemini_key):
         try:
-            return _parse_metadata(
-                _anthropic_vision(anthropic_key, image_bytes, media_type, _METADATA_PROMPT)
-            )
+            fn = _anthropic_vision if name == "Claude" else _gemini_vision
+            return _parse_metadata(fn(key, image_bytes, media_type, _METADATA_PROMPT))
         except Exception:
-            pass
-    if gemini_key:
-        try:
-            return _parse_metadata(
-                _gemini_vision(gemini_key, image_bytes, media_type, _METADATA_PROMPT)
-            )
-        except Exception:
-            pass
+            continue
     return {}

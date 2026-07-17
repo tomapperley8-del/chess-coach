@@ -73,6 +73,15 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^\w-]", "_", name).strip("_") or "game"
 
 
+def safe_name(name: str) -> str:
+    """Public: turn a user-typed game name into a safe file/id stem."""
+    return _safe_name(name)
+
+
+def name_taken(user: str, name: str) -> bool:
+    return os.path.exists(path_for(user, name))
+
+
 def path_for(user: str, game_id: str) -> str:
     return os.path.join(_user_dir(user), f"{_safe_name(game_id)}.pgn")
 

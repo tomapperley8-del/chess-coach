@@ -134,7 +134,7 @@ def _save():
         pass  # read-only filesystem is fine; download still works
 
 
-def _start_game(start_fen, prefix, headers, review):
+def _start_game(start_fen, prefix, headers, review, game_name):
     st.session_state.start_fen = start_fen
     st.session_state.prefix = prefix
     st.session_state.appended = []
@@ -147,7 +147,7 @@ def _start_game(start_fen, prefix, headers, review):
     st.session_state.reviewed = {e["ply"] for e in review}
     st.session_state.analyses = {}
     st.session_state.coachings = {}
-    st.session_state.game_id = gamestore.new_game_id(headers.get("white"), headers.get("black"))
+    st.session_state.game_id = gamestore.safe_name(game_name)
     st.session_state.stage = "game"
     _save()
 
@@ -361,8 +361,19 @@ elif stage == "confirm":
             except ValueError:
                 st.error("That's not a valid FEN placement.")
 
+    game_name = st.text_input(
+        "Name this game", key="new_game_name",
+        placeholder="e.g. vs Dave — Tuesday blitz",
+    ).strip()
+
     if not board.is_valid():
         st.warning("This position isn't legal yet (check kings/pawns). Fix it above.")
+    elif not game_name:
+        st.info("Give this game a name to start.")
+        st.button("Looks right — start coaching", type="primary",
+                  width="stretch", disabled=True)
+    elif gamestore.name_taken(username, game_name):
+        st.warning(f"You already have a game called “{game_name}”. Pick another name.")
     else:
         if st.button("Looks right — start coaching", type="primary", width="stretch"):
             st.session_state.my_elo = my_elo
@@ -413,7 +424,7 @@ elif stage == "confirm":
                         "screenshot position only."
                     )
 
-            _start_game(start_fen, prefix, headers, review)
+            _start_game(start_fen, prefix, headers, review, game_name)
             st.rerun()
 
     if st.button("Start over"):
@@ -433,6 +444,28 @@ elif stage == "game":
     h = st.session_state.headers
 
     fast_mode = st.session_state.get("fast_mode", False)
+
+    # --- game name + one-tap switcher (no need to go via "New game" first) ---
+    st.subheader(f"♟ {st.session_state.game_id}")
+    _paths = gamestore.list_saved(username)
+    _names = [os.path.splitext(os.path.basename(p))[0] for p in _paths]
+    if st.session_state.game_id not in _names:      # not yet on disk
+        _names.insert(0, st.session_state.game_id)
+        _paths.insert(0, None)
+    _NEW = "➕ New game (upload a screenshot)"
+    _choice = st.selectbox(
+        "Switch game", _names + [_NEW],
+        index=_names.index(st.session_state.game_id), key="game_switch",
+    )
+    if _choice == _NEW:
+        _reset()
+        st.rerun()
+    elif _choice != st.session_state.game_id:
+        _p = _paths[_names.index(_choice)]
+        if _p and _resume_saved(_p):
+            st.rerun()
+        else:
+            st.error("Couldn't open that game.")
 
     # --- persistent status line, shown above the board at all times ---
     status_line = st.empty()
@@ -532,7 +565,15 @@ elif stage == "game":
 
     # --- coaching (needs an AI key; everything else works without) ---
     if not game_over and analysis:
-        auto_coach = st.checkbox("Coach me automatically on my move", value=True)
+        c_opt, c_prov = st.columns([1, 1])
+        auto_coach = c_opt.checkbox("Coach me automatically", value=True)
+        with c_prov:
+            prov_label = st.selectbox(
+                "Coach", list(coach.PROVIDERS.values()), key="provider_label",
+                label_visibility="collapsed",
+            )
+        provider = next(k for k, v in coach.PROVIDERS.items() if v == prov_label)
+
         if my_turn and _has_llm() and (auto_coach or st.button("Coach this position")):
             coaching = st.session_state.coachings.get(fen)
             if coaching is None:
@@ -543,10 +584,15 @@ elif stage == "game":
                             opponent_elo=st.session_state.opp_elo,
                             game_review=st.session_state.review or None,
                             anthropic_key=_api_key(), gemini_key=_gemini_key(),
+                            provider=provider,
                         )
                         st.session_state.coachings[fen] = coaching
                     except Exception as exc:
-                        st.error(f"Coaching call failed: {exc}")
+                        st.warning(
+                            f"Coach unavailable ({coach.short_error(exc)}). "
+                            "Try another coach in the dropdown — the engine "
+                            "analysis below still works."
+                        )
             if coaching:
                 st.markdown(coaching)
         elif my_turn and not _has_llm():

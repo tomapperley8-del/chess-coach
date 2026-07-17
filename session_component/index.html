@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8" /></head>
+<body style="margin:0;padding:0;background:transparent">
+<script>
+(function () {
+  // Invisible browser-storage bridge for the login token.
+  //
+  // Writes to BOTH localStorage and a cookie, and reads back whichever
+  // survives. localStorage is the primary: it survives a cold launch from an
+  // iOS home-screen icon (which opens the bare URL with no query string) and
+  // isn't subject to the cookie quirks that made the previous library flaky.
+  // This iframe is same-origin with the app, so its storage is the app's.
+  var KEY = "cc_auth";
+  var DAYS = 30;
+
+  function post(msg) { window.parent.postMessage(msg, "*"); }
+  function send(value) {
+    post({ isStreamlitMessage: true, type: "streamlit:setComponentValue",
+           value: value, dataType: "json" });
+  }
+  function setHeight(h) {
+    post({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h });
+  }
+
+  function readCookie() {
+    var m = document.cookie.match(/(?:^|;\s*)cc_auth=([^;]*)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function writeCookie(v) {
+    document.cookie = KEY + "=" + encodeURIComponent(v) +
+      "; Max-Age=" + (60 * 60 * 24 * DAYS) + "; Path=/; SameSite=Lax";
+  }
+  function clearCookie() {
+    document.cookie = KEY + "=; Max-Age=0; Path=/; SameSite=Lax";
+  }
+
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    var a = e.data.args || {};
+
+    if (a.clear) {
+      try { window.localStorage.removeItem(KEY); } catch (err) {}
+      try { clearCookie(); } catch (err) {}
+    } else if (a.set) {
+      try { window.localStorage.setItem(KEY, a.set); } catch (err) {}
+      try { writeCookie(a.set); } catch (err) {}
+    }
+
+    var tok = null;
+    try { tok = window.localStorage.getItem(KEY); } catch (err) {}
+    if (!tok) { try { tok = readCookie(); } catch (err) {} }
+
+    setHeight(0);
+    // Always answer, even when empty, so Python can tell "nothing stored"
+    // apart from "haven't heard back yet".
+    send({ token: tok || null, n: a.nonce || 0 });
+  });
+
+  setHeight(0);
+  post({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 });
+})();
+</script>
+</body>
+</html>

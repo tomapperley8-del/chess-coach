@@ -2,38 +2,35 @@
 
 This is not real security - usernames and passwords sit in plain text in the
 secrets box. It's meant to stop a stranger who finds the URL from seeing
-someone else's saved games and spending their Anthropic credit, for a small
-trusted group (you + a few friends). Don't reuse a real password here.
+someone else's saved games and spending their API credit, for a small trusted
+group (you + a few friends). Don't reuse a real password here.
 
 Staying logged in:
-- A signed token in a browser COOKIE is the primary mechanism. The browser
-  sends it on every visit to the domain, including a cold launch from a phone
-  home-screen icon - which the old URL-only approach missed, because the icon
-  opens the bare URL with no query string.
-- The same token in the URL query string is a fallback for reloads where the
-  cookie hasn't been written yet or cookies are blocked.
-Both require a SESSION_SECRET in secrets; without it, persistence is off and
-the visitor logs in each session (old behaviour), rather than trusting a
-guessable key.
+- A signed token in browser localStorage (plus a cookie) is the primary
+  mechanism, read/written by our own invisible component (session_component/).
+  It survives a cold launch from a phone home-screen icon, which opens the bare
+  URL with no query string - the case the URL-token approach always missed, and
+  the reason logins kept dropping on mobile.
+- The URL query string is kept as an instant, no-round-trip fallback.
+Both require a SESSION_SECRET in secrets; without it persistence is off and the
+visitor logs in each session, rather than trusting a guessable key.
 
-Cookie writes/removals are deferred by one run: streamlit-cookies-controller
-performs them via an invisible component that only executes when its script
-run completes, so calling set()/remove() and immediately st.rerun() would
-abort the write. We queue the operation, rerun, then perform it on a run that
-renders to completion.
+The storage component answers on a later run than the one that mounts it (it
+has to round-trip through its iframe), so a cold load shows a brief "Restoring
+your session" gate rather than flashing the login form and then logging in.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
 import hashlib
 import hmac
+import os
 
 import streamlit as st
-from streamlit_cookies_controller import CookieController
+import streamlit.components.v1 as components
 
-_COOKIE_NAME = "cc_auth"
-_COOKIE_DAYS = 30
+_DIR = os.path.join(os.path.dirname(__file__), "session_component")
+_store_component = components.declare_component("cc_session", path=_DIR)
 
 
 def _session_secret() -> str | None:
@@ -51,59 +48,62 @@ def _valid(username: str, token: str, users: dict, secret: str) -> bool:
     return username in users and hmac.compare_digest(token, _sign(username, secret))
 
 
-def _try_resume(users: dict, controller: CookieController) -> str | None:
-    secret = _session_secret()
-    if not secret:
+def _run_store():
+    """Render the storage bridge and return its answer.
+
+    Returns None until the component has reported back, then
+    {"token": str|None, "n": int}. Any queued write/clear is applied here.
+    """
+    pending_set = st.session_state.pop("_store_set", None)
+    pending_clear = st.session_state.pop("_store_clear", False)
+    if pending_set or pending_clear:
+        st.session_state["_store_nonce"] = st.session_state.get("_store_nonce", 0) + 1
+    return _store_component(
+        set=pending_set,
+        clear=pending_clear,
+        nonce=st.session_state.get("_store_nonce", 0),
+        default=None,
+    )
+
+
+def _resume_from(token: str | None, users: dict, secret: str | None) -> str | None:
+    if not secret or not token or "|" not in token:
         return None
-    # Cookie first (survives a cold launch from a home-screen icon).
-    raw = controller.get(_COOKIE_NAME)
-    if raw and "|" in raw:
-        user, token = raw.split("|", 1)
-        if _valid(user, token, users, secret):
-            return user
-    # URL query string fallback (survives a reload before the cookie exists).
-    user = st.query_params.get("u")
-    token = st.query_params.get("t")
-    if user and token and _valid(user, token, users, secret):
-        return user
-    return None
+    user, sig = token.split("|", 1)
+    return user if _valid(user, sig, users, secret) else None
 
 
 def require_login() -> str:
     """Block until the visitor signs in. Returns the logged-in username."""
-    controller = CookieController()
-
-    # Perform any cookie op queued on the previous run, now that this run will
-    # render to completion (see module docstring).
-    pending_set = st.session_state.pop("_cookie_set", None)
-    if pending_set:
-        controller.set(
-            _COOKIE_NAME, pending_set,
-            expires=_dt.datetime.now() + _dt.timedelta(days=_COOKIE_DAYS),
-            same_site="lax",
-        )
-    if st.session_state.pop("_cookie_clear", False):
-        try:
-            controller.remove(_COOKIE_NAME)
-        except Exception:
-            pass
+    stored = _run_store()  # must render every run so the component stays mounted
 
     if st.session_state.get("user"):
         return st.session_state["user"]
 
     users = dict(st.secrets.get("users", {}))
+    secret = _session_secret()
 
-    # After an explicit logout, block auto-resume for the rest of this browser
-    # session. The cookie component keeps an in-memory cache of the cookie that
-    # outlives the actual browser cookie we just deleted, so without this guard
-    # a follow-up rerun would resurrect the login from that stale cache. A real
-    # page reload starts a fresh session where this flag is gone (and the
-    # cookie is genuinely absent), so login persistence still works.
+    # An explicit logout blocks auto-resume for the rest of this browser session
+    # (the component may still hold the pre-clear token in memory).
     if not st.session_state.get("_logged_out"):
-        resumed = _try_resume(users, controller)
-        if resumed:
-            st.session_state["user"] = resumed
-            return resumed
+        # 1. URL token: instant, no round trip.
+        u, t = st.query_params.get("u"), st.query_params.get("t")
+        if secret and u and t and _valid(u, t, users, secret):
+            st.session_state["user"] = u
+            return u
+        # 2. Stored token from the browser.
+        if stored is None and not st.session_state.get("_store_gave_up"):
+            st.title("♞ Chess Coach")
+            st.caption("Restoring your session…")
+            if st.button("Sign in instead"):
+                st.session_state["_store_gave_up"] = True
+                st.rerun()
+            st.stop()
+        if stored:
+            resumed = _resume_from(stored.get("token"), users, secret)
+            if resumed:
+                st.session_state["user"] = resumed
+                return resumed
 
     st.title("♞ Chess Coach")
     st.subheader("Sign in")
@@ -124,10 +124,10 @@ def require_login() -> str:
         if password and users.get(username) == password:
             st.session_state["user"] = username
             st.session_state.pop("_logged_out", None)
-            secret = _session_secret()
+            st.session_state.pop("_store_gave_up", None)
             if secret:
                 token = _sign(username, secret)
-                st.session_state["_cookie_set"] = f"{username}|{token}"
+                st.session_state["_store_set"] = f"{username}|{token}"
                 st.query_params["u"] = username
                 st.query_params["t"] = token
             st.rerun()
@@ -141,6 +141,6 @@ def logout_button():
         st.query_params.clear()
         for key in list(st.session_state.keys()):
             del st.session_state[key]
-        st.session_state["_cookie_clear"] = True  # remove browser cookie next run
-        st.session_state["_logged_out"] = True     # block cache-based resume
+        st.session_state["_store_clear"] = True   # wipe browser storage next run
+        st.session_state["_logged_out"] = True    # block auto-resume this session
         st.rerun()
