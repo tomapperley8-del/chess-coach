@@ -513,14 +513,18 @@ elif stage == "game":
 
     # --- board (game_mode: moves handled locally in JS, no reload per move) ---
     if not game_over:
-        res = chessboard.show_board(
-            fen,
-            game_mode=True,
-            flush=flush_requested,
-            orientation=orientation,
-            last_move=chessboard.last_move_squares(board),
-            key="game_board",
-        )
+        try:
+            res = chessboard.show_board(
+                fen,
+                game_mode=True,
+                flush=flush_requested,
+                orientation=orientation,
+                last_move=chessboard.last_move_squares(board),
+                key="game_board",
+            )
+        except TypeError as exc:
+            st.error(f"Board error: {exc}")
+            res = None
         # Process flushed moves from the component
         if res and res.get("moves"):
             new_moves = res["moves"]
